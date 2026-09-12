@@ -1,0 +1,30 @@
+{
+  "name": "aura-osm-data",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "format": "node tools/check.ts format",
+    "lint": "node tools/check.ts lint",
+    "typecheck": "tsc --noEmit",
+    "check": "node tools/check.ts",
+    "test": "node --test tests/*.test.ts",
+    "test:serve": "node tests/worker_harness.ts",
+    "dev": "node tools/dev.ts",
+    "build": "node tools/build.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.13",
+    "@cloudflare/workers-types": "5.20260910.1",
+    "@stylistic/eslint-plugin": "5.10.0",
+    "@types/node": "22.20.2",
+    "@typescript-eslint/parser": "8.70.0",
+    "esbuild": "0.28.2",
+    "eslint": "10.10.0",
+    "miniflare": "5.20260910.0-alpha",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+.build/
+target/
+.wrangler/
+.dev.vars*
+.env*
+*.pbf
+*.osm
+*.opl
+*.sqlite*
+*.db*
+*.log
+*.pem

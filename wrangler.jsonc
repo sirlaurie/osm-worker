@@ -1,0 +1,22 @@
+{
+  "$schema": "https://unpkg.com/wrangler@4.131.0/config-schema.json",
+  "name": "aura-osm-data",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "secrets": { "required": ["PUBLISH_TOKEN"] },
+  "r2_buckets": [{ "binding": "DATA", "bucket_name": "aura-osm-data" }],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": false,
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true
+    }
+  }
+}
