@@ -8,6 +8,7 @@ export const MAX_CURRENT = 1024 * 1024;
 export const MAX_REGIONS = 256;
 export const MAX_MANIFEST = 8 * 1024 * 1024;
 export const MAX_BLOCK = 262144;
+export const MAX_PACK = 1024 * 1024;
 export const MAX_QUERY_BYTES = 16 * 1024 * 1024;
 export const MAX_COVERAGE_POINTS = 100000;
 
@@ -18,15 +19,40 @@ export interface Poi {
   tags: Record<string, string>;
 }
 
-export interface Manifest {
-  schema: 1;
+interface ManifestFields {
   region: string;
   sourceTimestamp: string;
   sourceSequence: number | null;
   sourceSHA256: string;
   coverage: Coverage;
-  cells: Record<string, string[]>;
   count: number;
+}
+
+export interface LegacyManifest extends ManifestFields {
+  schema: 1;
+  cells: Record<string, string[]>;
+  packs?: string[];
+}
+
+export type PackedPage = [
+  hash: string,
+  packIndex: number,
+  offset: number,
+  length: number,
+];
+
+export interface PackedManifest extends ManifestFields {
+  schema: 2;
+  cells: Record<string, PackedPage[]>;
+  packs: string[];
+}
+
+export type Manifest = LegacyManifest | PackedManifest;
+
+export interface PackedBlock {
+  pack: string;
+  offset: number;
+  length: number;
 }
 
 export interface RegionRelease {
@@ -160,7 +186,7 @@ function validCoverage(value: unknown): value is Coverage {
 export function validateManifest(value: unknown): asserts value is Manifest {
   if (
     !record(value) ||
-    value.schema !== 1 ||
+    (value.schema !== 1 && value.schema !== 2) ||
     typeof value.region !== "string" ||
     !REGION.test(value.region) ||
     !timestamp(value.sourceTimestamp) ||
@@ -173,6 +199,23 @@ export function validateManifest(value: unknown): asserts value is Manifest {
   )
     throw new ServiceError(503, "invalid_manifest");
 
+  if (
+    value.schema === 2
+      ? !Array.isArray(value.packs) ||
+        !value.packs.every(
+          (hash, index, hashes) =>
+            typeof hash === "string" &&
+            HASH.test(hash) &&
+            (index === 0 || hashes[index - 1] < hash),
+        )
+      : value.packs !== undefined &&
+        (!Array.isArray(value.packs) || value.packs.length !== 0)
+  )
+    throw new ServiceError(503, "invalid_manifest");
+
+  const references = new Set<string>();
+  const ranges = new Map<number, { offset: number; length: number }[]>();
+
   for (const [cell, pages] of Object.entries(value.cells)) {
     const match = /^(0|[1-9]\d*)_(0|[1-9]\d*)$/.exec(cell);
 
@@ -181,15 +224,60 @@ export function validateManifest(value: unknown): asserts value is Manifest {
       Number(match[1]) > 17999 ||
       Number(match[2]) > 35999 ||
       !Array.isArray(pages) ||
-      pages.length === 0 ||
-      !pages.every((hash) => typeof hash === "string" && HASH.test(hash)) ||
-      new Set(pages).size !== pages.length
+      pages.length === 0
     )
       throw new ServiceError(503, "invalid_manifest");
+
+    if (value.schema === 1) {
+      if (
+        !pages.every((hash) => typeof hash === "string" && HASH.test(hash)) ||
+        new Set(pages).size !== pages.length
+      )
+        throw new ServiceError(503, "invalid_manifest");
+    } else {
+      for (const page of pages) {
+        if (
+          !Array.isArray(page) ||
+          page.length !== 4 ||
+          typeof page[0] !== "string" ||
+          !HASH.test(page[0]) ||
+          references.has(page[0]) ||
+          !integer(page[1]) ||
+          !integer(page[2]) ||
+          !integer(page[3]) ||
+          page[1] >= (value.packs as string[]).length ||
+          page[3] < 1 ||
+          page[3] > MAX_BLOCK ||
+          page[2] + page[3] > MAX_PACK
+        )
+          throw new ServiceError(503, "invalid_manifest");
+
+        references.add(page[0]);
+        const slices = ranges.get(page[1]) ?? [];
+        slices.push({ offset: page[2], length: page[3] });
+        ranges.set(page[1], slices);
+      }
+    }
   }
 
   if ((Object.keys(value.cells).length === 0) !== (value.count === 0))
     throw new ServiceError(503, "invalid_manifest");
+
+  if (value.schema === 1) return;
+
+  if ((value.packs as string[]).length !== ranges.size)
+    throw new ServiceError(503, "invalid_manifest");
+
+  for (const slices of ranges.values()) {
+    slices.sort((a, b) => a.offset - b.offset);
+    let end = 0;
+
+    for (const range of slices) {
+      if (range.offset !== end) throw new ServiceError(503, "invalid_manifest");
+
+      end += range.length;
+    }
+  }
 }
 
 export function validateCurrent(value: unknown): asserts value is Current {
@@ -337,25 +425,49 @@ export async function readImmutable(
   maximum: number,
   origin: string,
   ctx: Pick<ExecutionContext, "waitUntil">,
+  packed?: PackedBlock,
 ): Promise<{ value: unknown; size: number }> {
   const cacheKey = new Request(`${origin}/__objects/${key}`);
   const cached = await caches.default.match(cacheKey);
   let bytes: Uint8Array;
 
+  if (packed && packed.length > maximum)
+    throw new ServiceError(503, "object_too_large");
+
   if (cached) {
     bytes = await readBytes(cached.body, maximum);
   } else {
-    const object = await bucket.get(key);
+    const object = packed
+      ? await bucket.get(`packs/${packed.pack}.bin`, {
+          range: { offset: packed.offset, length: packed.length },
+        })
+      : await bucket.get(key);
 
     if (!object) throw new ServiceError(503, "missing_object");
 
-    if (object.size > maximum) {
+    if (object.size > (packed ? MAX_PACK : maximum)) {
       await object.body.cancel();
       throw new ServiceError(503, "object_too_large");
     }
 
-    bytes = await readBytes(object.body, maximum);
+    if (
+      packed &&
+      (!object.range ||
+        !("offset" in object.range) ||
+        !("length" in object.range) ||
+        object.range.offset !== packed.offset ||
+        object.range.length !== packed.length ||
+        object.size < packed.offset + packed.length)
+    ) {
+      await object.body.cancel();
+      throw new ServiceError(503, "invalid_range");
+    }
+
+    bytes = await readBytes(object.body, packed?.length ?? maximum);
   }
+
+  if (packed && bytes.byteLength !== packed.length)
+    throw new ServiceError(503, "invalid_range");
 
   if ((await sha256(bytes)) !== hash)
     throw new ServiceError(503, "corrupt_object");

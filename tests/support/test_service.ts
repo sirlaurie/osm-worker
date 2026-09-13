@@ -77,7 +77,12 @@ export async function startTestService(work: string) {
   ): Promise<void> {
     const key = request.url?.replace(/^\/test-osm\//, "");
 
-    if (!key || !/^(blocks|manifests)\/[a-f0-9]{64}\.json$/.test(key)) {
+    if (
+      !key ||
+      !/^((blocks|manifests)\/[a-f0-9]{64}\.json|packs\/[a-f0-9]{64}\.bin)$/.test(
+        key,
+      )
+    ) {
       response.writeHead(400).end();
 
       return;
@@ -135,7 +140,10 @@ export async function startTestService(work: string) {
       request.headers["x-amz-content-sha256"] !== hash ||
       request.headers["x-amz-meta-sha256"] !== hash ||
       Number(request.headers["content-length"]) !== bytes.length ||
-      request.headers["content-type"] !== "application/json" ||
+      request.headers["content-type"] !==
+        (key.startsWith("packs/")
+          ? "application/octet-stream"
+          : "application/json") ||
       !authorization.includes("if-none-match") ||
       !authorization.includes("x-amz-meta-sha256")
     ) {

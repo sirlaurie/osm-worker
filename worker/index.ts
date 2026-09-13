@@ -4,6 +4,7 @@ import {
   MAX_CURRENT,
   MAX_MANIFEST,
   MAX_QUERY_BYTES,
+  type PackedBlock,
   type Poi,
   parseJSON,
   readBytes,
@@ -279,7 +280,10 @@ async function loadCandidates(
         a.region.localeCompare(b.region),
     );
   const coverages: Coverage[] = [];
-  const blocks = new Map<string, Set<string>>();
+  const blocks = new Map<
+    string,
+    { cells: Set<string>; packed?: PackedBlock }
+  >();
   let manifestBytes = 0;
 
   for (const release of releases) {
@@ -307,10 +311,26 @@ async function loadCandidates(
     coverages.push(manifest.coverage);
 
     for (const cell of cells) {
-      for (const hash of manifest.cells[cell] ?? []) {
-        const blockCells = blocks.get(hash) ?? new Set<string>();
-        blockCells.add(cell);
-        blocks.set(hash, blockCells);
+      const pages =
+        manifest.schema === 1
+          ? (manifest.cells[cell] ?? []).map((hash) => ({
+              hash,
+              packed: undefined,
+            }))
+          : (manifest.cells[cell] ?? []).map(
+              ([hash, packIndex, offset, length]) => ({
+                hash,
+                packed: { pack: manifest.packs[packIndex], offset, length },
+              }),
+            );
+
+      for (const { hash, packed } of pages) {
+        const block = blocks.get(hash) ?? {
+          cells: new Set<string>(),
+          packed,
+        };
+        block.cells.add(cell);
+        blocks.set(hash, block);
 
         if (blocks.size > 128) throw new ServiceError(503, "query_too_large");
       }
@@ -325,7 +345,7 @@ async function loadCandidates(
   const seen = new Set<string>();
   let blockBytes = 0;
 
-  for (const [hash, expectedCells] of blocks) {
+  for (const [hash, block] of blocks) {
     const loaded = await readImmutable(
       env.DATA,
       `blocks/${hash}.json`,
@@ -333,12 +353,13 @@ async function loadCandidates(
       Math.min(MAX_BLOCK, MAX_QUERY_BYTES - blockBytes),
       url.origin,
       ctx,
+      block.packed,
     );
     blockBytes += loaded.size;
     validateBlock(loaded.value);
 
     for (const poi of loaded.value) {
-      if (!expectedCells.has(cellFor(poi.lat, poi.lon)))
+      if (!block.cells.has(cellFor(poi.lat, poi.lon)))
         throw new ServiceError(503, "cell_mismatch");
 
       if (seen.has(poi.id)) continue;

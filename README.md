@@ -35,3 +35,11 @@ Worker 使用 `COORDINATOR` Durable Object 管理任务、设备租约和当前�
 从单任务协调器升级时，停止旧 Builder，部署 Worker，再更新并启动 Builder。协调器将已存储的无 `slot` 租约和领取记录迁移到位置 0，保留 token、代次、批次及当前发布清单。新领取请求必须包含 `slot`，释放请求必须包含 `outcome`；旧版 Builder 不能混跑。
 
 Builder 命令与多设备操作见 [OSM Builder](../osm-builder/README.md#多设备处理)。本地检查使用 `npm run check`、`npm test`、`npm run build`。
+
+## R2 打包格式
+
+Worker 同时读取 schema 1 的独立 JSON 小块和 schema 2 的打包数据，支持各地区分批升级。schema 2 清单的 `packs` 是排序且唯一的 SHA-256 目录，`cells` 中每项为 `[小块哈希, 包编号, 偏移, 长度]`；对应对象为 `packs/<包哈希>.bin`，最大 1 MiB。
+
+查询使用 R2 Range 读取所需小块，校验范围、长度及小块哈希后执行原有筛选和分页。Cache API 仍按小块哈希缓存，打包位置变化不使未变的小块缓存失效。查询接口、POI 数量和 0.01° 网格不变。
+
+先部署此 Worker，再升级 Builder 并提交 `osm update all --submit-only`；已发布的旧地区无需停服或清空存储。此格式升级保留旧对象，不执行 R2 列举或删除。

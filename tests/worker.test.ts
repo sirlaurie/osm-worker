@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash, timingSafeEqual } from "node:crypto";
 import test from "node:test";
-import type { Current, Manifest, Poi, RegionRelease } from "../worker/data.ts";
+import type {
+  Current,
+  LegacyManifest,
+  Manifest,
+  Poi,
+  RegionRelease,
+} from "../worker/data.ts";
 import {
   type Coverage,
   cellFor,
@@ -260,7 +266,7 @@ function environment() {
 function addManifest(
   env: ReturnType<typeof environment>,
   records: Poi[],
-  options: Partial<Manifest> = {},
+  options: Partial<LegacyManifest> = {},
 ) {
   const groups = new Map<string, Poi[]>();
 
@@ -282,7 +288,7 @@ function addManifest(
     cells[cell] = [digest];
   }
 
-  const manifest: Manifest = {
+  const manifest: LegacyManifest = {
     schema: 1,
     region: "test",
     sourceTimestamp: "2026-09-11T00:00:00Z",
@@ -342,7 +348,7 @@ async function admin(
 
 async function publish(
   env: ReturnType<typeof environment>,
-  item: ReturnType<typeof addManifest>,
+  item: { manifest: Manifest; digest: string },
 ) {
   const start = await admin(env, "/admin/jobs/start", {
     requestId: crypto.randomUUID(),
