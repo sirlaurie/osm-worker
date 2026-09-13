@@ -10,6 +10,7 @@ interface WorkerConfig {
   compatibility_date: string;
   compatibility_flags: string[];
   r2_buckets: { binding: string; bucket_name: string }[];
+  durable_objects: { bindings: { name: string; class_name: string }[] };
 }
 
 export async function workerConfig(): Promise<WorkerConfig> {
@@ -51,9 +52,15 @@ export async function localRuntime(
 ): Promise<Miniflare> {
   const config = await workerConfig();
   const data = config.r2_buckets.find((bucket) => bucket.binding === "DATA");
+  const coordinator = config.durable_objects.bindings.find(
+    (binding) => binding.name === "COORDINATOR",
+  );
 
   if (!data)
     throw new Error("Worker configuration requires the DATA R2 binding");
+
+  if (!coordinator)
+    throw new Error("Worker configuration requires the COORDINATOR binding");
 
   return new Miniflare({
     host: "127.0.0.1",
@@ -69,6 +76,12 @@ export async function localRuntime(
           type: "worker",
           compatibilityDate: config.compatibility_date,
           compatibilityFlags: config.compatibility_flags,
+          exports: {
+            [coordinator.class_name]: {
+              type: "durable-object",
+              storage: "sqlite",
+            },
+          },
           manifest: {
             mainModule: "index.js",
             modules: {
@@ -77,6 +90,11 @@ export async function localRuntime(
           },
           env: {
             DATA: { type: "r2", name: data.bucket_name },
+            COORDINATOR: {
+              type: "durable-object",
+              worker: config.name,
+              exportName: coordinator.class_name,
+            },
             PUBLISH_TOKEN: { type: "json", value: token },
           },
         },

@@ -336,7 +336,7 @@ export async function readImmutable(
   hash: string,
   maximum: number,
   origin: string,
-  ctx: ExecutionContext,
+  ctx: Pick<ExecutionContext, "waitUntil">,
 ): Promise<{ value: unknown; size: number }> {
   const cacheKey = new Request(`${origin}/__objects/${key}`);
   const cached = await caches.default.match(cacheKey);

@@ -10,7 +10,7 @@ import {
   TEST_PUBLISH_TOKEN,
 } from "./support/test_service.ts";
 
-test("Miniflare serves published R2 data and preserves conditional uploads and publication", async () => {
+test("Miniflare serves published R2 data and preserves conditional uploads and leased publication", async () => {
   await mkdir(".build/tests", { recursive: true });
   const work = await mkdtemp(path.resolve(".build/tests/runtime-"));
 
@@ -110,6 +110,28 @@ test("Miniflare serves published R2 data and preserves conditional uploads and p
         count: 2,
       };
       const digest = await upload("manifests", manifest);
+      const start = await fetch(`${service.worker}/admin/jobs/start`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requestId: crypto.randomUUID(),
+          mode: "bootstrap",
+          regions: [{ id: "test", extract: "test/region" }],
+        }),
+      });
+      assert.equal(start.status, 200);
+      const claim = await fetch(`${service.worker}/admin/jobs/claim`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          deviceId: crypto.randomUUID(),
+          requestId: crypto.randomUUID(),
+          localRegions: [],
+        }),
+      });
+      assert.equal(claim.status, 200);
+      const { lease } = await claim.json<{ lease: Record<string, unknown> }>();
+      assert(lease);
       const publish = () =>
         fetch(`${service.worker}/admin/publish`, {
           method: "POST",
@@ -117,7 +139,7 @@ test("Miniflare serves published R2 data and preserves conditional uploads and p
           body: JSON.stringify({
             region: "test",
             manifest: digest,
-            baseRevision: null,
+            lease,
           }),
         });
       const published = await publish();
@@ -185,7 +207,7 @@ test("Miniflare serves published R2 data and preserves conditional uploads and p
         body: JSON.stringify({
           region: "test",
           manifest: newer,
-          baseRevision: null,
+          lease,
         }),
       });
       assert.equal(conflict.status, 409);
@@ -198,7 +220,6 @@ test("Miniflare serves published R2 data and preserves conditional uploads and p
       assert.deepEqual(await objects.json(), {
         keys: [
           `blocks/${block}.json`,
-          "current.json",
           `manifests/${digest}.json`,
           `manifests/${newer}.json`,
         ].sort(),

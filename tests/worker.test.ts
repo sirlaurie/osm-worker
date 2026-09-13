@@ -11,7 +11,7 @@ import {
   type Position,
   queryBounds,
 } from "../worker/geo.ts";
-import worker from "../worker/index.ts";
+import worker, { Coordinator } from "../worker/index.ts";
 import type { PoiItem } from "../worker/poi.ts";
 
 crypto.subtle.timingSafeEqual = (a, b) =>
@@ -63,6 +63,17 @@ interface ResponseFields {
   regions: RegionRelease[];
   unchanged: boolean;
   error: string;
+  batchId: string;
+  lease: {
+    batchId: string;
+    region: string;
+    extract: string;
+    deviceId: string;
+    token: string;
+    generation: number;
+    expiresAt: string;
+    renewAfterSeconds: number;
+  } | null;
   pagination: {
     page: number;
     limit: number;
@@ -145,6 +156,50 @@ class Bucket {
   }
 }
 
+class ObjectStorage {
+  entries = new Map<string, unknown>();
+  private pending: Promise<unknown> = Promise.resolve();
+
+  async get(key: string) {
+    return structuredClone(this.entries.get(key));
+  }
+
+  async put(key: string | Record<string, unknown>, value?: unknown) {
+    const values: [string, unknown][] =
+      typeof key === "string" ? [[key, value]] : Object.entries(key);
+
+    for (const [name, item] of values) {
+      this.entries.set(name, structuredClone(item));
+    }
+  }
+
+  async delete(key: string) {
+    return this.entries.delete(key);
+  }
+
+  async list(options: { prefix?: string } = {}) {
+    return new Map(
+      [...this.entries]
+        .filter(([key]) => key.startsWith(options.prefix ?? ""))
+        .map(([key, value]) => [key, structuredClone(value)]),
+    );
+  }
+
+  async transaction<T>(callback: (storage: ObjectStorage) => Promise<T>) {
+    const task = this.pending.then(async () => {
+      const transaction = new ObjectStorage();
+      transaction.entries = structuredClone(this.entries);
+      const result = await callback(transaction);
+      this.entries = transaction.entries;
+
+      return result;
+    });
+    this.pending = task.catch(() => {});
+
+    return task;
+  }
+}
+
 function environment() {
   const entries = new Map<string, Response>();
   Object.defineProperty(globalThis, "caches", {
@@ -161,7 +216,44 @@ function environment() {
     },
   });
 
-  return { DATA: new Bucket(), PUBLISH_TOKEN: token, cacheEntries: entries };
+  const storage = new ObjectStorage();
+  const env = {
+    DATA: new Bucket(),
+    PUBLISH_TOKEN: token,
+    COORDINATOR: {} as DurableObjectNamespace,
+    cacheEntries: entries,
+    storage,
+  };
+  let coordinator: Coordinator | undefined;
+  let ready = Promise.resolve();
+  const state = {
+    storage,
+    blockConcurrencyWhile<T>(callback: () => Promise<T>) {
+      const task = callback();
+      ready = task.then(() => {});
+
+      return task;
+    },
+    waitUntil() {},
+  };
+  env.COORDINATOR = {
+    idFromName: () => "global",
+    get: () => ({
+      async fetch(request: Request | string) {
+        coordinator ??= new Coordinator(
+          state as unknown as DurableObjectState,
+          env as unknown as Env,
+        );
+        await ready;
+
+        return coordinator.fetch(
+          typeof request === "string" ? new Request(request) : request,
+        );
+      },
+    }),
+  } as unknown as DurableObjectNamespace;
+
+  return env;
 }
 
 function addManifest(
@@ -232,23 +324,50 @@ async function call(
   };
 }
 
-async function publish(
+async function admin(
   env: ReturnType<typeof environment>,
-  item: ReturnType<typeof addManifest>,
-  baseRevision: string | null = null,
+  path: string,
+  value: unknown,
 ) {
-  return call(env, "/admin/publish", {
+  return call(env, path, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      region: item.manifest.region,
-      manifest: item.digest,
-      baseRevision,
-    }),
+    body: JSON.stringify(value),
   });
+}
+
+async function publish(
+  env: ReturnType<typeof environment>,
+  item: ReturnType<typeof addManifest>,
+) {
+  const start = await admin(env, "/admin/jobs/start", {
+    requestId: crypto.randomUUID(),
+    mode: "update",
+    regions: [
+      { id: item.manifest.region, extract: `test/${item.manifest.region}` },
+    ],
+  });
+  assert.equal(start.status, 200, JSON.stringify(start.body));
+  const claimed = await admin(env, "/admin/jobs/claim", {
+    deviceId: crypto.randomUUID(),
+    requestId: crypto.randomUUID(),
+    localRegions: [item.manifest.region],
+  });
+  assert.equal(claimed.status, 200, JSON.stringify(claimed.body));
+  assert(claimed.body.lease);
+  const result = await admin(env, "/admin/publish", {
+    region: item.manifest.region,
+    manifest: item.digest,
+    lease: claimed.body.lease,
+  });
+
+  if (result.status !== 200)
+    await admin(env, "/admin/jobs/release", { lease: claimed.body.lease });
+
+  return result;
 }
 
 test("an unpublished region returns successful uncovered results, not a failure", async () => {
@@ -348,7 +467,7 @@ test("names are matched before limit, preserve localized output and use unrounde
 
 test("scan pages compose the filtered deduplicated distance order and reuse one candidate cache", async () => {
   const env = environment();
-  const older = await publish(
+  await publish(
     env,
     addManifest(
       env,
@@ -374,7 +493,6 @@ test("scan pages compose the filtered deduplicated distance order and reuse one 
       ],
       { region: "new", sourceTimestamp: "2026-09-12T00:00:00Z" },
     ),
-    older.body.revision,
   );
   const expectedIds = [90, 10, 20, 30, 40, 50].map((id) => `osm_node_${id}`);
   const first = await call(env, "/api/osm/scan?lat=0&lng=0&q=cafe");
@@ -558,7 +676,6 @@ test("scan revision pins reject a newer publication instead of combining changed
     addManifest(env, [poi(1, 0, 0), ...records], {
       sourceTimestamp: "2026-09-12T00:00:00Z",
     }),
-    one.body.revision,
   );
   assert.equal(two.status, 200);
   assert.notEqual(two.body.revision, first.body.revision);
@@ -730,20 +847,13 @@ test("missing, corrupt or misfiled blocks and manifests return 503", async () =>
     if (failure === "cell") {
       const cells = { "9000_17999": [digest] };
       const changed = addManifest(env, [], { cells, count: 1 });
-      const state = (
-        await call(env, "/admin/state", {
-          headers: { Authorization: `Bearer ${token}` },
-        })
-      ).body;
-      await publish(env, changed, state.revision);
+      await publish(env, changed);
     }
 
     if (failure === "manifest") {
-      const current: Current = JSON.parse(
-        env.DATA.stored("current.json").bytes.toString(),
-      );
+      const current = (await env.storage.get("current")) as Current;
       current.regions[0].manifest = "b".repeat(64);
-      env.DATA.save("current.json", current);
+      await env.storage.put("current", current);
     }
 
     const result = await call(env, "/api/osm/scan?lat=0&lng=0");
@@ -758,7 +868,7 @@ test("missing, corrupt or misfiled blocks and manifests return 503", async () =>
   }
 });
 
-test("immutable blocks can be cached while every query reads current from R2", async () => {
+test("immutable blocks can be cached while queries observe coordinator publications", async () => {
   const env = environment();
   const first = addManifest(env, [poi(1, 0, 0, "Old")]);
   const one = await publish(env, first);
@@ -777,12 +887,12 @@ test("immutable blocks can be cached while every query reads current from R2", a
   );
   assert.equal(
     env.DATA.reads.filter((key) => key === "current.json").length,
-    currentReads + 1,
+    currentReads,
   );
   const second = addManifest(env, [poi(1, 0, 0, "New")], {
     sourceTimestamp: "2026-09-12T00:00:00Z",
   });
-  await publish(env, second, one.body.revision);
+  await publish(env, second);
   const result = await call(env, "/api/osm/scan?lat=0&lng=0");
   assert.equal(result.headers.get("X-Edge-Cache-Status"), "MISS");
   assert.equal(result.body.results[0].name, "New");
@@ -805,7 +915,7 @@ test("cache writes cannot turn successful queries into service errors", async ()
 
 test("duplicate OSM IDs across overlapping releases return once using the newer dataset", async () => {
   const env = environment();
-  const first = await publish(
+  await publish(
     env,
     addManifest(env, [poi(1, 0, 0, "Old")], { region: "old" }),
   );
@@ -813,7 +923,7 @@ test("duplicate OSM IDs across overlapping releases return once using the newer 
     region: "new",
     sourceTimestamp: "2026-09-12T00:00:00Z",
   });
-  await publish(env, second, first.body.revision);
+  await publish(env, second);
   const response = await call(env, "/api/osm/scan?lat=0&lng=0");
   assert.equal(response.body.count, 1);
   assert.equal(response.body.results[0].name, "New");
@@ -846,48 +956,96 @@ test("publish authenticates before R2 access, validates manifests, and rejects s
   const older = addManifest(env, [], {
     sourceTimestamp: "2026-09-10T00:00:00Z",
   });
-  assert.equal(
-    (await publish(env, older, first.body.revision)).body.error,
-    "source_regression",
-  );
+  assert.equal((await publish(env, older)).body.error, "source_regression");
   const malformed = addManifest(env, [], {
     cells: { bad: ["a".repeat(64)] },
     count: 1,
   });
-  assert.equal(
-    (await publish(env, malformed, first.body.revision)).status,
-    503,
-  );
+  assert.equal((await publish(env, malformed)).status, 503);
   const badTime = addManifest(env, [], {
     sourceTimestamp: "2026-02-30T00:00:00Z",
   });
-  assert.equal((await publish(env, badTime, first.body.revision)).status, 503);
+  assert.equal((await publish(env, badTime)).status, 503);
 });
 
-test("compare-and-swap prevents concurrent lost publications and identical retries are idempotent", async () => {
+test("expired claims are reassigned and the prior lease cannot renew or publish", async (context) => {
   const env = environment();
-  const a = addManifest(env, [], { region: "a" });
-  const b = addManifest(env, [], { region: "b" });
-  const pair = await Promise.all([publish(env, a), publish(env, b)]);
-  assert.deepEqual(pair.map((result) => result.status).sort(), [200, 409]);
-  const current: Current = JSON.parse(
-    env.DATA.stored("current.json").bytes.toString(),
-  );
-  assert.equal(current.regions.length, 1);
-  const retry = current.regions[0].region === "a" ? a : b;
-  assert.equal((await publish(env, retry, null)).body.unchanged, true);
-  const remaining = retry === a ? b : a;
-  assert.equal((await publish(env, remaining, current.revision)).status, 200);
+  const item = addManifest(env, []);
+  let now = Date.now();
+  context.mock.method(Date, "now", () => now);
+  const start = await admin(env, "/admin/jobs/start", {
+    requestId: crypto.randomUUID(),
+    mode: "bootstrap",
+    regions: [{ id: "test", extract: "test/region" }],
+  });
+  assert.equal(start.status, 200);
+  const firstRequest = {
+    deviceId: crypto.randomUUID(),
+    requestId: crypto.randomUUID(),
+    localRegions: [],
+  };
+  const first = await admin(env, "/admin/jobs/claim", firstRequest);
+  assert(first.body.lease);
+  now = Date.parse(first.body.lease.expiresAt) + 1;
+  const expired = await admin(env, "/admin/publish", {
+    region: "test",
+    manifest: item.digest,
+    lease: first.body.lease,
+  });
+  assert.equal(expired.status, 409);
+  assert.equal(expired.body.error, "lease_lost");
   assert.equal(
-    (JSON.parse(env.DATA.stored("current.json").bytes.toString()) as Current)
-      .regions.length,
-    2,
+    (await admin(env, "/admin/jobs/claim", firstRequest)).body.lease,
+    null,
   );
-  const fresh = environment();
-  const c = addManifest(fresh, []);
-  const identical = await Promise.all([publish(fresh, c), publish(fresh, c)]);
-  assert(identical.every((result) => result.status === 200));
-  assert.equal(identical[0].body.revision, identical[1].body.revision);
+  const second = await admin(env, "/admin/jobs/claim", {
+    deviceId: crypto.randomUUID(),
+    requestId: crypto.randomUUID(),
+    localRegions: [],
+  });
+  assert(second.body.lease);
+  assert(second.body.lease.generation > first.body.lease.generation);
+  assert.equal(
+    (await admin(env, "/admin/jobs/renew", { lease: first.body.lease })).status,
+    409,
+  );
+  assert.equal(
+    (
+      await admin(env, "/admin/publish", {
+        region: "test",
+        manifest: item.digest,
+        lease: first.body.lease,
+      })
+    ).status,
+    409,
+  );
+  assert.equal(
+    (
+      await admin(env, "/admin/publish", {
+        region: "test",
+        manifest: item.digest,
+        lease: second.body.lease,
+      })
+    ).status,
+    200,
+  );
+  const completed = await admin(env, "/admin/publish", {
+    region: "test",
+    manifest: item.digest,
+    lease: second.body.lease,
+  });
+  assert.equal(completed.status, 200);
+  now = Date.parse(second.body.lease.expiresAt) + 1;
+  assert.equal(
+    (
+      await admin(env, "/admin/publish", {
+        region: "test",
+        manifest: item.digest,
+        lease: second.body.lease,
+      })
+    ).status,
+    200,
+  );
 });
 
 test("publishing 256 regions preserves current when the region limit is exceeded", async () => {
@@ -896,11 +1054,7 @@ test("publishing 256 regions preserves current when the region limit is exceeded
   let revision: string | null = null;
 
   for (const [index, region] of regions.entries()) {
-    const result = await publish(
-      env,
-      addManifest(env, [], { region }),
-      revision,
-    );
+    const result = await publish(env, addManifest(env, [], { region }));
     assert.equal(result.status, 200, region);
     revision = result.body.revision;
 
@@ -917,27 +1071,25 @@ test("publishing 256 regions preserves current when the region limit is exceeded
   const query = await call(env, "/api/osm/scan?lat=0&lng=0");
   assert.equal(query.status, 200);
   assert.equal(query.body.coverage, "covered");
-  const before = env.DATA.entries.get("current.json");
+  const before = await env.storage.get("current");
   const overflow = await publish(
     env,
     addManifest(env, [], { region: "overflow" }),
-    revision,
   );
   assert.equal(overflow.status, 409);
   assert.equal(overflow.body.error, "region_limit");
-  assert.equal(env.DATA.entries.get("current.json"), before);
+  assert.deepEqual(await env.storage.get("current"), before);
   const replacement = addManifest(env, [], {
     region: regions[0],
     sourceTimestamp: "2026-09-12T00:00:00Z",
   });
-  assert.equal((await publish(env, replacement, revision)).status, 200);
-  const current: Current = JSON.parse(
-    env.DATA.stored("current.json").bytes.toString(),
-  );
+  assert.equal((await publish(env, replacement)).status, 200);
+  const current = (await env.storage.get("current")) as Current;
   assert.equal(current.regions.length, 256);
   current.regions.push({ ...current.regions[0], region: "invalid-overflow" });
-  env.DATA.save("current.json", current);
-  assert.equal((await call(env, "/health")).body.error, "invalid_current");
+  const invalid = environment();
+  invalid.DATA.save("current.json", current);
+  assert.equal((await call(invalid, "/health")).body.error, "invalid_current");
 });
 
 test("coverage point limits apply per region when queries span multiple releases", async () => {
@@ -949,7 +1101,6 @@ test("coverage point limits apply per region when queries span multiple releases
   });
   ring.push(ring[0]);
   const coverage: Coverage = { type: "Polygon", coordinates: [ring] };
-  let revision: string | null = null;
 
   for (const id of [1, 2]) {
     const result = await publish(
@@ -958,10 +1109,8 @@ test("coverage point limits apply per region when queries span multiple releases
         region: `region-${id}`,
         coverage,
       }),
-      revision,
     );
     assert.equal(result.status, 200);
-    revision = result.body.revision;
   }
 
   const response = await call(env, "/api/osm/scan?lat=0&lng=0");
@@ -976,7 +1125,7 @@ test("coverage point limits apply per region when queries span multiple releases
     region: "oversized",
     coverage: { type: "Polygon", coordinates: [[...ring, ring[0]]] },
   });
-  const rejected = await publish(env, oversized, revision);
+  const rejected = await publish(env, oversized);
   assert.equal(rejected.status, 503);
   assert.equal(rejected.body.error, "invalid_manifest");
 });

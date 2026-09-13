@@ -6,6 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "secrets": { "required": ["PUBLISH_TOKEN"] },
   "r2_buckets": [{ "binding": "DATA", "bucket_name": "aura-osm-data" }],
+  "durable_objects": {
+    "bindings": [{ "name": "COORDINATOR", "class_name": "Coordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coordinator"] }],
   "observability": {
     "logs": {
       "enabled": true,

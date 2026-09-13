@@ -1,22 +1,19 @@
 import {
   type Current,
-  HASH,
   MAX_BLOCK,
   MAX_CURRENT,
   MAX_MANIFEST,
   MAX_QUERY_BYTES,
-  MAX_REGIONS,
   type Poi,
   parseJSON,
-  REGION,
   readBytes,
-  readCurrent,
   readImmutable,
   record,
   releaseFor,
   ServiceError,
   UUID,
   validateBlock,
+  validateCurrent,
   validateManifest,
 } from "./data.ts";
 import {
@@ -29,6 +26,8 @@ import {
   queryBounds,
 } from "./geo.ts";
 import { formatPoi, type MatchedPoi, matchPoi } from "./poi.ts";
+
+export { Coordinator } from "./coordinator.ts";
 
 function json(value: unknown, status = 200): Response {
   return Response.json(value, {
@@ -85,113 +84,22 @@ async function authorize(request: Request, env: Env): Promise<void> {
     throw new ServiceError(401, "unauthorized");
 }
 
-async function publish(
-  request: Request,
-  env: Env,
-  ctx: ExecutionContext,
-  origin: string,
-): Promise<Response> {
-  if (
-    request.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase() !==
-    "application/json"
-  )
-    throw new ServiceError(415, "expected_json");
+function coordinator(env: Env): DurableObjectStub {
+  return env.COORDINATOR.get(env.COORDINATOR.idFromName("global"));
+}
 
-  const payload = parseJSON(await readBytes(request.body, 4096, 413), 400);
-
-  if (
-    !record(payload) ||
-    typeof payload.region !== "string" ||
-    !REGION.test(payload.region) ||
-    typeof payload.manifest !== "string" ||
-    !HASH.test(payload.manifest) ||
-    (payload.baseRevision !== null &&
-      (typeof payload.baseRevision !== "string" ||
-        !UUID.test(payload.baseRevision)))
-  )
-    throw new ServiceError(400, "invalid_publish");
-
-  const { current, etag } = await readCurrent(env.DATA);
-  const existing = current?.regions.find(
-    (entry) => entry.region === payload.region,
+async function readPublished(env: Env): Promise<Current | null> {
+  const response = await coordinator(env).fetch(
+    "https://coordinator/admin/state",
   );
 
-  if (current && existing?.manifest === payload.manifest)
-    return json({
-      success: true,
-      revision: current.revision,
-      unchanged: true,
-    });
+  if (!response.ok) throw new ServiceError(503, "coordinator_unavailable");
 
-  if ((current?.revision ?? null) !== payload.baseRevision)
-    throw new ServiceError(409, "revision_conflict");
+  const current = parseJSON(await readBytes(response.body, MAX_CURRENT));
 
-  const { value } = await readImmutable(
-    env.DATA,
-    `manifests/${payload.manifest}.json`,
-    payload.manifest,
-    MAX_MANIFEST,
-    origin,
-    ctx,
-  );
-  validateManifest(value);
+  if (current !== null) validateCurrent(current);
 
-  if (value.region !== payload.region)
-    throw new ServiceError(400, "region_mismatch");
-
-  if (
-    existing &&
-    Date.parse(value.sourceTimestamp) < Date.parse(existing.sourceTimestamp)
-  )
-    throw new ServiceError(409, "source_regression");
-
-  const next: Current = {
-    schema: 1,
-    revision: crypto.randomUUID(),
-    regions: [
-      ...(current?.regions ?? []).filter(
-        (entry) => entry.region !== payload.region,
-      ),
-      releaseFor(value, payload.manifest),
-    ].sort((a, b) => a.region.localeCompare(b.region)),
-  };
-
-  if (next.regions.length > MAX_REGIONS)
-    throw new ServiceError(409, "region_limit");
-
-  const bytes = new TextEncoder().encode(JSON.stringify(next));
-
-  if (bytes.byteLength > MAX_CURRENT)
-    throw new ServiceError(409, "current_too_large");
-
-  const result = await env.DATA.put("current.json", bytes, {
-    onlyIf:
-      etag === null
-        ? new Headers({ "If-None-Match": "*" })
-        : { etagMatches: etag },
-    httpMetadata: { contentType: "application/json", cacheControl: "no-store" },
-  });
-
-  if (!result) {
-    const latest = (await readCurrent(env.DATA)).current;
-
-    if (
-      latest?.regions.some(
-        (entry) =>
-          entry.region === payload.region &&
-          entry.manifest === payload.manifest,
-      )
-    )
-      return json({
-        success: true,
-        revision: latest.revision,
-        unchanged: true,
-      });
-
-    throw new ServiceError(409, "revision_conflict");
-  }
-
-  return json({ success: true, revision: next.revision, unchanged: false });
+  return current;
 }
 
 async function query(
@@ -242,7 +150,7 @@ async function query(
 
   if (Array.from(name).length > 100) throw new ServiceError(400, "invalid_q");
 
-  const { current } = await readCurrent(env.DATA);
+  const current = await readPublished(env);
 
   if (revision !== null && revision !== current?.revision)
     throw new ServiceError(409, "revision_conflict");
@@ -453,26 +361,17 @@ export default {
     try {
       const url = new URL(request.url);
 
-      if (
-        url.pathname === "/admin/state" ||
-        url.pathname === "/admin/publish"
-      ) {
+      if (url.pathname.startsWith("/admin/")) {
         await authorize(request, env);
 
-        if (url.pathname === "/admin/state" && request.method === "GET")
-          return json((await readCurrent(env.DATA)).current);
-
-        if (url.pathname === "/admin/publish" && request.method === "POST")
-          return await publish(request, env, ctx, url.origin);
-
-        throw new ServiceError(405, "method_not_allowed");
+        return await coordinator(env).fetch(request);
       }
 
       if (request.method !== "GET")
         throw new ServiceError(405, "method_not_allowed");
 
       if (url.pathname === "/health") {
-        const { current } = await readCurrent(env.DATA);
+        const current = await readPublished(env);
 
         return json({
           success: true,
