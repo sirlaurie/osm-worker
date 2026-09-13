@@ -69,6 +69,7 @@ interface ResponseFields {
     region: string;
     extract: string;
     deviceId: string;
+    slot: 0 | 1;
     token: string;
     generation: number;
     expiresAt: string;
@@ -352,6 +353,7 @@ async function publish(
   });
   assert.equal(start.status, 200, JSON.stringify(start.body));
   const claimed = await admin(env, "/admin/jobs/claim", {
+    slot: 0,
     deviceId: crypto.randomUUID(),
     requestId: crypto.randomUUID(),
     localRegions: [item.manifest.region],
@@ -365,7 +367,10 @@ async function publish(
   });
 
   if (result.status !== 200)
-    await admin(env, "/admin/jobs/release", { lease: claimed.body.lease });
+    await admin(env, "/admin/jobs/release", {
+      lease: claimed.body.lease,
+      outcome: "failed",
+    });
 
   return result;
 }
@@ -980,6 +985,7 @@ test("expired claims are reassigned and the prior lease cannot renew or publish"
   });
   assert.equal(start.status, 200);
   const firstRequest = {
+    slot: 0,
     deviceId: crypto.randomUUID(),
     requestId: crypto.randomUUID(),
     localRegions: [],
@@ -999,6 +1005,7 @@ test("expired claims are reassigned and the prior lease cannot renew or publish"
     null,
   );
   const second = await admin(env, "/admin/jobs/claim", {
+    slot: 1,
     deviceId: crypto.randomUUID(),
     requestId: crypto.randomUUID(),
     localRegions: [],
@@ -1044,6 +1051,89 @@ test("expired claims are reassigned and the prior lease cannot renew or publish"
         lease: second.body.lease,
       })
     ).status,
+    200,
+  );
+});
+
+test("renewing one slot does not keep the other slot alive or let its expired request claim again", async (context) => {
+  const env = environment();
+  let now = Date.now();
+  context.mock.method(Date, "now", () => now);
+  assert.equal(
+    (
+      await admin(env, "/admin/jobs/start", {
+        requestId: crypto.randomUUID(),
+        mode: "update",
+        regions: [
+          { id: "a", extract: "test/a" },
+          { id: "b", extract: "test/b" },
+        ],
+      })
+    ).status,
+    200,
+  );
+  const deviceId = crypto.randomUUID();
+  const request = {
+    deviceId,
+    requestId: crypto.randomUUID(),
+    localRegions: [],
+    slot: 1,
+  };
+  const first = (
+    await admin(env, "/admin/jobs/claim", {
+      ...request,
+      requestId: crypto.randomUUID(),
+      slot: 0,
+    })
+  ).body.lease;
+  const second = (await admin(env, "/admin/jobs/claim", request)).body.lease;
+  assert(first && second);
+  now += 180_000;
+  assert.equal(
+    (await admin(env, "/admin/jobs/renew", { lease: first })).status,
+    200,
+  );
+  now = Date.parse(second.expiresAt) + 1;
+  assert.equal(
+    (await admin(env, "/admin/jobs/claim", request)).body.lease,
+    null,
+  );
+  const recovered = (
+    await admin(env, "/admin/jobs/claim", {
+      ...request,
+      requestId: crypto.randomUUID(),
+      slot: 0,
+    })
+  ).body.lease;
+  assert(recovered);
+  assert.equal(recovered.region, first.region);
+  assert.equal(recovered.token, first.token);
+  const replacement = (
+    await admin(env, "/admin/jobs/claim", {
+      deviceId: crypto.randomUUID(),
+      requestId: crypto.randomUUID(),
+      localRegions: [],
+      slot: 0,
+    })
+  ).body.lease;
+  assert(replacement);
+  assert.equal(replacement.region, second.region);
+  assert(replacement.generation > second.generation);
+  assert.equal(
+    (await admin(env, "/admin/jobs/renew", { lease: second })).status,
+    409,
+  );
+  assert.equal(
+    (
+      await admin(env, "/admin/jobs/release", {
+        lease: second,
+        outcome: "retry",
+      })
+    ).status,
+    409,
+  );
+  assert.equal(
+    (await admin(env, "/admin/jobs/renew", { lease: first })).status,
     200,
   );
 });

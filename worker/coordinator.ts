@@ -27,6 +27,7 @@ export interface Lease {
   region: string;
   extract: string;
   deviceId: string;
+  slot: 0 | 1;
   token: string;
   generation: number;
   expiresAt: string;
@@ -102,6 +103,7 @@ function validLease(value: unknown): value is Lease {
     !REGION.test(value.region) ||
     !extract(value.extract) ||
     !uuid(value.deviceId) ||
+    (value.slot !== 0 && value.slot !== 1) ||
     !uuid(value.token) ||
     typeof value.generation !== "number" ||
     !Number.isSafeInteger(value.generation) ||
@@ -133,6 +135,7 @@ function sameLease(current: Lease | null, lease: Lease): boolean {
     current.region === lease.region &&
     current.extract === lease.extract &&
     current.deviceId === lease.deviceId &&
+    current.slot === lease.slot &&
     current.token === lease.token &&
     current.generation === lease.generation
   );
@@ -259,27 +262,46 @@ export class Coordinator {
     this.state = state;
     this.env = env;
     this.ready = state.blockConcurrencyWhile(async () => {
-      if (await state.storage.get<boolean>("migration_complete")) return;
+      if (!(await state.storage.get<boolean>("migration_complete"))) {
+        const { current } = await readCurrent(env.DATA);
+        const imported: Current | null =
+          current === null
+            ? null
+            : {
+                schema: 1,
+                revision: current.revision,
+                regions: current.regions.map(
+                  ({ region, manifest, sourceTimestamp, bbox }) => ({
+                    region,
+                    manifest,
+                    sourceTimestamp,
+                    bbox,
+                  }),
+                ),
+              };
+        await state.storage.transaction(async (transaction) => {
+          await transaction.put("current", imported);
+          await transaction.put("migration_complete", true);
+        });
+      }
 
-      const { current } = await readCurrent(env.DATA);
-      const imported: Current | null =
-        current === null
-          ? null
-          : {
-              schema: 1,
-              revision: current.revision,
-              regions: current.regions.map(
-                ({ region, manifest, sourceTimestamp, bbox }) => ({
-                  region,
-                  manifest,
-                  sourceTimestamp,
-                  bbox,
-                }),
-              ),
-            };
+      if (await state.storage.get<boolean>("lease_slots_migrated")) return;
+
       await state.storage.transaction(async (transaction) => {
-        await transaction.put("current", imported);
-        await transaction.put("migration_complete", true);
+        for (const prefix of ["job:", "claim:"]) {
+          const entries = await transaction.list<{
+            lease: (Omit<Lease, "slot"> & { slot?: Lease["slot"] }) | null;
+          }>({ prefix });
+
+          for (const [key, value] of entries) {
+            if (value.lease && value.lease.slot === undefined) {
+              value.lease.slot = 0;
+              await transaction.put(key, value);
+            }
+          }
+        }
+
+        await transaction.put("lease_slots_migrated", true);
       });
     });
   }
@@ -344,11 +366,13 @@ export class Coordinator {
       if (!record(payload) || !validLease(payload.lease))
         throw new ServiceError(400, "invalid_lease");
 
-      return json(
-        path === "/admin/jobs/renew"
-          ? await this.renew(payload.lease)
-          : await this.release(payload.lease),
-      );
+      if (path === "/admin/jobs/renew")
+        return json(await this.renew(payload.lease));
+
+      if (payload.outcome !== "failed" && payload.outcome !== "retry")
+        throw new ServiceError(400, "invalid_release");
+
+      return json(await this.release(payload.lease, payload.outcome));
     } catch (error) {
       if (error instanceof ServiceError)
         return json({ success: false, error: error.code }, error.status);
@@ -452,6 +476,7 @@ export class Coordinator {
       !record(payload) ||
       !uuid(payload.deviceId) ||
       !uuid(payload.requestId) ||
+      (payload.slot !== 0 && payload.slot !== 1) ||
       !Array.isArray(payload.localRegions) ||
       payload.localRegions.length > MAX_REGIONS ||
       !payload.localRegions.every(
@@ -461,7 +486,7 @@ export class Coordinator {
     )
       throw new ServiceError(400, "invalid_claim");
 
-    const { deviceId, requestId } = payload;
+    const { deviceId, requestId, slot } = payload;
     const localRegions = payload.localRegions as string[];
 
     return this.state.storage.transaction(async (transaction) => {
@@ -486,6 +511,9 @@ export class Coordinator {
       const jobs = batch ? await loadJobs(transaction, batch) : [];
 
       if (prior) {
+        if (prior.lease.slot !== slot)
+          throw new ServiceError(400, "invalid_claim");
+
         const job = jobs.find((entry) => sameLease(entry.lease, prior.lease));
         const lease = job && status(job, now) === "running" ? job.lease : null;
 
@@ -495,7 +523,9 @@ export class Coordinator {
       let lease =
         jobs.find(
           (job) =>
-            status(job, now) === "running" && job.lease?.deviceId === deviceId,
+            status(job, now) === "running" &&
+            job.lease?.deviceId === deviceId &&
+            job.lease.slot === slot,
         )?.lease ?? null;
 
       if (!lease && batch && !batch.finishedAt) {
@@ -545,6 +575,7 @@ export class Coordinator {
             region: job.region,
             extract: job.extract,
             deviceId,
+            slot,
             token: crypto.randomUUID(),
             generation,
             expiresAt: new Date(now + LEASE_SECONDS * 1000).toISOString(),
@@ -595,16 +626,20 @@ export class Coordinator {
     });
   }
 
-  private async release(lease: Lease) {
+  private async release(lease: Lease, outcome: "failed" | "retry") {
     return this.state.storage.transaction(async (transaction) => {
       const now = Date.now();
       const job = await leaseJob(transaction, lease);
 
-      if (job.status === "failed" || job.status === "completed")
+      if (
+        job.status === "pending" ||
+        job.status === "failed" ||
+        job.status === "completed"
+      )
         return { success: true };
 
       requireRunning(job, now);
-      job.status = "failed";
+      job.status = outcome === "retry" ? "pending" : "failed";
       job.updatedAt = new Date(now).toISOString();
       await transaction.put(`job:${lease.batchId}:${lease.region}`, job);
       const batch = await loadBatch(transaction, lease.batchId);
@@ -733,6 +768,7 @@ export class Coordinator {
           status: status(job, now),
           generation: job.generation,
           deviceId: job.lastOwner,
+          slot: job.lease?.slot ?? null,
           expiresAt: job.lease?.expiresAt ?? null,
           manifest: job.manifest,
         })),

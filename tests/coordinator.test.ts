@@ -3,7 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import test, { type TestContext } from "node:test";
-import { localRuntime } from "../tools/runtime.ts";
+import { Miniflare } from "miniflare";
+import { localRuntime, workerConfig } from "../tools/runtime.ts";
 import type { Current, Manifest } from "../worker/data.ts";
 import { TEST_PUBLISH_TOKEN } from "./support/test_service.ts";
 
@@ -12,6 +13,7 @@ interface Lease {
   region: string;
   extract: string;
   deviceId: string;
+  slot: 0 | 1;
   token: string;
   generation: number;
   expiresAt: string;
@@ -28,9 +30,81 @@ interface JobResponse {
   failed: number;
 }
 
-async function fixture(context: TestContext) {
+async function seedCoordinator(work: string, records: Record<string, unknown>) {
+  const config = await workerConfig();
+  const runtime = new Miniflare({
+    host: "127.0.0.1",
+    port: 0,
+    cf: false,
+    telemetry: { enabled: false },
+    resourcePersistencePath: path.join(work, "storage"),
+    resourceTmpPath: path.join(work, "tmp"),
+    workers: [
+      {
+        config: {
+          name: config.name,
+          type: "worker",
+          compatibilityDate: config.compatibility_date,
+          exports: {
+            Coordinator: { type: "durable-object", storage: "sqlite" },
+          },
+          env: {
+            COORDINATOR: {
+              type: "durable-object",
+              worker: config.name,
+              exportName: "Coordinator",
+            },
+          },
+          manifest: {
+            mainModule: "seed.js",
+            modules: {
+              "seed.js": {
+                type: "esm",
+                contents: `
+          export class Coordinator {
+            constructor(state) { this.state = state; }
+            async fetch(request) {
+              await this.state.storage.put(await request.json());
+              return new Response("seeded");
+            }
+          }
+          export default {
+            fetch(request, env) {
+              return env.COORDINATOR.get(env.COORDINATOR.idFromName("global")).fetch(request);
+            }
+          }`,
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+
+  try {
+    const response = await runtime.dispatchFetch(
+      "https://coordinator.test/seed",
+      {
+        method: "POST",
+        body: JSON.stringify(records),
+      },
+    );
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "seeded");
+  } finally {
+    await runtime.dispose();
+  }
+}
+
+async function fixture(
+  context: TestContext,
+  records?: Record<string, unknown>,
+) {
   await mkdir(".build/tests", { recursive: true });
   const work = await mkdtemp(path.resolve(".build/tests/coordinator-"));
+
+  if (records) await seedCoordinator(work, records);
+
   let runtime = await localRuntime(work, TEST_PUBLISH_TOKEN);
   context.after(async () => {
     await runtime.dispose();
@@ -70,7 +144,8 @@ async function fixture(context: TestContext) {
     localRegions: string[],
     deviceId = randomUUID(),
     requestId = randomUUID(),
-  ) => post("/admin/jobs/claim", { deviceId, requestId, localRegions });
+    slot: 0 | 1 = 0,
+  ) => post("/admin/jobs/claim", { deviceId, requestId, localRegions, slot });
   const manifest = async (
     region: string,
     sourceTimestamp = "2026-09-12T00:00:00Z",
@@ -185,6 +260,7 @@ test("concurrent claims and publications preserve separate regions and idempoten
   assert.equal(starts[0].body.batchId, starts[1].body.batchId);
   assert.equal((await service.start(["c"])).body.error, "batch_active");
   const firstRequest = {
+    slot: 0,
     deviceId: randomUUID(),
     requestId: randomUUID(),
     localRegions: [],
@@ -235,7 +311,12 @@ test("concurrent claims and publications preserve separate regions and idempoten
     null,
   );
   assert.equal(
-    (await service.post("/admin/jobs/release", { lease: first })).status,
+    (
+      await service.post("/admin/jobs/release", {
+        lease: first,
+        outcome: "failed",
+      })
+    ).status,
     200,
   );
   assert.equal((await service.claim([])).body.lease, null);
@@ -258,6 +339,262 @@ test("the first migrated batch reserves existing indexes for an online device", 
   assert.equal(claimed.body.lease?.deviceId, owner);
 });
 
+test("two stable slots bound concurrent claims and keep request retries in their original slot", async (context) => {
+  const service = await fixture(context);
+  assert.equal((await service.start(["a", "b", "c", "d"])).status, 200);
+  const deviceId = randomUUID();
+  const requests = [0, 1].map((slot) => ({
+    deviceId,
+    slot,
+    requestId: randomUUID(),
+    localRegions: [],
+  }));
+  const claims = await Promise.all([
+    service.post("/admin/jobs/claim", requests[0]),
+    service.post("/admin/jobs/claim", requests[1]),
+    service.post("/admin/jobs/claim", requests[0]),
+    service.claim([], deviceId),
+  ]);
+  assert(
+    claims.every((response) => response.status === 200 && response.body.lease),
+  );
+  const first = claims[0].body.lease;
+  const second = claims[1].body.lease;
+  assert(first && second);
+  assert.equal(first.slot, 0);
+  assert.equal(second.slot, 1);
+  assert.notEqual(first.region, second.region);
+  assert.deepEqual(claims[2].body.lease, first);
+  assert.deepEqual(claims[3].body.lease, first);
+  assert.deepEqual(
+    (await service.claim([], deviceId, randomUUID(), 1)).body.lease,
+    second,
+  );
+
+  for (const slot of [undefined, 2, -1, "0"]) {
+    const rejected = await service.post("/admin/jobs/claim", {
+      ...requests[0],
+      requestId: randomUUID(),
+      slot,
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error, "invalid_claim");
+  }
+
+  assert.equal(
+    (await service.post("/admin/jobs/claim", { ...requests[0], slot: 1 }))
+      .status,
+    400,
+  );
+  const other = (await service.claim([])).body.lease;
+  assert(other);
+  assert(![first.region, second.region].includes(other.region));
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: { ...first, slot: 1 } }))
+      .status,
+    409,
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: first })).status,
+    200,
+  );
+  const digest = await service.manifest(first.region);
+  assert.equal(
+    (
+      await service.post("/admin/publish", {
+        region: first.region,
+        manifest: digest,
+        lease: first,
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/claim", requests[0])).body.lease,
+    null,
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/claim", { ...requests[0], slot: 1 }))
+      .status,
+    400,
+  );
+  const replacement = (await service.claim([], deviceId)).body.lease;
+  assert(replacement);
+  assert.equal(replacement.slot, 0);
+  assert(
+    ![first.region, second.region, other.region].includes(replacement.region),
+  );
+  assert.deepEqual(
+    (await service.claim([], deviceId, randomUUID(), 1)).body.lease,
+    second,
+  );
+});
+
+test("retry release returns only its region to pending and fences the returned lease", async (context) => {
+  const service = await fixture(context);
+  assert.equal((await service.start(["a", "b"])).status, 200);
+  const deviceId = randomUUID();
+  const first = (await service.claim([], deviceId)).body.lease;
+  const requestId = randomUUID();
+  const second = (await service.claim([], deviceId, requestId, 1)).body.lease;
+  assert(first && second);
+  assert.equal(
+    (await service.post("/admin/jobs/release", { lease: second })).status,
+    400,
+  );
+  const retry = { lease: second, outcome: "retry" };
+  assert.equal((await service.post("/admin/jobs/release", retry)).status, 200);
+  assert.equal((await service.post("/admin/jobs/release", retry)).status, 200);
+  assert.equal(
+    (await service.post("/admin/jobs/release", { ...retry, outcome: "failed" }))
+      .status,
+    200,
+  );
+  const pending = await service.claim([], deviceId, requestId, 1);
+  assert.equal(pending.body.lease, null);
+  assert.equal(pending.body.pending, 1);
+  assert.equal(pending.body.running, 1);
+  assert.equal(pending.body.failed, 0);
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: second })).status,
+    409,
+  );
+  const digest = await service.manifest(second.region);
+  assert.equal(
+    (
+      await service.post("/admin/publish", {
+        region: second.region,
+        manifest: digest,
+        lease: second,
+      })
+    ).status,
+    409,
+  );
+  const reassigned = (await service.claim([])).body.lease;
+  assert(reassigned);
+  assert.equal(reassigned.region, second.region);
+  assert(reassigned.generation > second.generation);
+  assert.equal((await service.post("/admin/jobs/release", retry)).status, 409);
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: reassigned })).status,
+    200,
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: first })).status,
+    200,
+  );
+  assert.equal(
+    (
+      await service.post("/admin/publish", {
+        region: second.region,
+        manifest: digest,
+        lease: reassigned,
+      })
+    ).status,
+    200,
+  );
+});
+
+test("slot migration preserves running legacy leases and claim identities across deployment", async (context) => {
+  const batchId = randomUUID();
+  const requestId = randomUUID();
+  const deviceId = randomUUID();
+  const now = Date.now();
+  const legacy = {
+    batchId,
+    deviceId,
+    region: "a",
+    extract: "test/a",
+    token: randomUUID(),
+    generation: 7,
+    expiresAt: new Date(now + 300_000).toISOString(),
+    renewAfterSeconds: 60,
+  };
+  const current: Current = { schema: 1, revision: randomUUID(), regions: [] };
+  const job = {
+    region: "a",
+    extract: "test/a",
+    status: "running",
+    generation: 7,
+    lastOwner: deviceId,
+    lease: legacy,
+    manifest: null,
+    updatedAt: new Date(now).toISOString(),
+  };
+  const service = await fixture(context, {
+    migration_complete: true,
+    current,
+    active_batch: batchId,
+    [`batch:${batchId}`]: {
+      batchId,
+      requestId: randomUUID(),
+      mode: "update",
+      regions: ["a", "b"],
+      createdAt: new Date(now).toISOString(),
+      finishedAt: null,
+    },
+    [`job:${batchId}:a`]: job,
+    [`job:${batchId}:b`]: {
+      ...job,
+      region: "b",
+      extract: "test/b",
+      status: "pending",
+      generation: 0,
+      lastOwner: null,
+      lease: null,
+    },
+    "generation:a": 7,
+    [`claim:${deviceId}:${requestId}`]: {
+      batchId,
+      lease: legacy,
+      retainUntil: now + 86_400_000,
+    },
+  });
+  await service.bucket.put(
+    "current.json",
+    JSON.stringify({ ...current, revision: randomUUID() }),
+  );
+  assert.deepEqual(
+    await (await service.request("/admin/state")).json(),
+    current,
+  );
+  assert.equal(
+    (
+      await service.post("/admin/jobs/claim", {
+        deviceId,
+        requestId,
+        localRegions: [],
+      })
+    ).status,
+    400,
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: legacy })).status,
+    400,
+  );
+  const recovered = (await service.claim([], deviceId, requestId)).body.lease;
+  assert.deepEqual(recovered, { ...legacy, slot: 0 });
+  assert.equal((await service.claim([], deviceId, requestId, 1)).status, 400);
+  assert.deepEqual((await service.claim([], deviceId)).body.lease, recovered);
+  const second = (await service.claim([], deviceId, randomUUID(), 1)).body
+    .lease;
+  assert(second);
+  assert.equal(second.region, "b");
+  await service.restart();
+  assert.deepEqual(
+    (await service.claim([], deviceId, requestId)).body.lease,
+    recovered,
+  );
+  assert.deepEqual(
+    (await service.claim([], deviceId, randomUUID(), 1)).body.lease,
+    second,
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease: recovered })).status,
+    200,
+  );
+});
+
 test("a released lease cannot publish after the region is assigned to another batch", async (context) => {
   const service = await fixture(context);
   assert.equal((await service.start(["a"])).status, 200);
@@ -265,10 +602,16 @@ test("a released lease cannot publish after the region is assigned to another ba
   assert(original);
   const released = await service.post("/admin/jobs/release", {
     lease: original,
+    outcome: "failed",
   });
   assert.equal(released.status, 200);
   assert.equal(
-    (await service.post("/admin/jobs/release", { lease: original })).status,
+    (
+      await service.post("/admin/jobs/release", {
+        lease: original,
+        outcome: "failed",
+      })
+    ).status,
     200,
   );
   assert.equal((await service.start(["a"])).status, 200);

@@ -125,6 +125,7 @@ test("Miniflare serves published R2 data and preserves conditional uploads and l
         headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify({
           deviceId: crypto.randomUUID(),
+          slot: 0,
           requestId: crypto.randomUUID(),
           localRegions: [],
         }),
