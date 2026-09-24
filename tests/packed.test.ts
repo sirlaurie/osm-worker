@@ -10,6 +10,7 @@ import {
   MAX_BLOCK,
   MAX_PACK,
   type Manifest,
+  Memo,
   type PackedManifest,
   type Poi,
   readImmutable,
@@ -372,6 +373,23 @@ test("Miniflare queries old and packed regions together and reuses logical cache
     near,
   ]);
   await publish(moved.manifest);
+  const concurrent = await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      query(`&limit=2&radius=150&q=${i % 2 ? "cafe" : ""}`),
+    ),
+  );
+
+  for (const result of concurrent)
+    assert.deepEqual(
+      result.body.results.map((record) => record.name),
+      ["Current cafe", "Second cafe"],
+    );
+
+  const movedKey = `manifests/${hash(Buffer.from(JSON.stringify(moved.manifest)))}.json`;
+  await bucket.delete(movedKey);
+  await caches.default.delete(`https://packed.test/__objects/${movedKey}`);
+  const memoised = await query("&limit=2&radius=200");
+  assert.deepEqual(memoised.body.results, first.body.results);
   const after = await query("&limit=2");
   assert.equal(after.status, "MISS");
   assert.notEqual(after.body.revision, first.body.revision);
@@ -391,4 +409,45 @@ test("Miniflare queries old and packed regions together and reuses logical cache
     ((await rejected.json()) as { error: string }).error,
     "corrupt_object",
   );
+});
+
+test("object memo evicts least recently used settled entries past its byte limit", async () => {
+  const memo = new Memo<string>(100);
+  const pending: Promise<unknown>[] = [];
+  const context = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise);
+    },
+  };
+  let reads = 0;
+  const load = (key: string, size: number) =>
+    memo.load(key, context, async () => {
+      reads++;
+
+      return { value: key, size };
+    });
+  let release = () => {};
+  const blocked = memo.load(
+    "pending",
+    { waitUntil() {} },
+    () =>
+      new Promise((resolve) => {
+        release = () => resolve({ value: "pending", size: 10 });
+      }),
+  );
+  await load("a", 40);
+  await load("b", 40);
+  await Promise.all(pending);
+  await load("a", 40);
+  await load("c", 40);
+  await Promise.all(pending);
+  assert.equal(reads, 3);
+  await load("a", 40);
+  await load("c", 40);
+  assert.equal(reads, 3);
+  await load("b", 40);
+  await Promise.all(pending);
+  assert.equal(reads, 4);
+  release();
+  assert.equal((await blocked).value, "pending");
 });

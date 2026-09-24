@@ -229,6 +229,7 @@ function environment() {
     PUBLISH_TOKEN: token,
     COORDINATOR: {} as DurableObjectNamespace,
     cacheEntries: entries,
+    coordinatorRequests: [] as string[],
     storage,
   };
   let coordinator: Coordinator | undefined;
@@ -247,6 +248,9 @@ function environment() {
     idFromName: () => "global",
     get: () => ({
       async fetch(request: Request | string) {
+        env.coordinatorRequests.push(
+          new URL(typeof request === "string" ? request : request.url).pathname,
+        );
         coordinator ??= new Coordinator(
           state as unknown as DurableObjectState,
           env as unknown as Env,
@@ -908,6 +912,105 @@ test("immutable blocks can be cached while queries observe coordinator publicati
   assert.equal(result.headers.get("X-Edge-Cache-Status"), "MISS");
   assert.equal(result.body.results[0].name, "New");
   assert.notEqual(result.body.revision, one.body.revision);
+});
+
+test("concurrent scans share one coordinator read and one load per immutable object", async () => {
+  const env = environment();
+  const records = Array.from({ length: 20 }, (_, i) =>
+    poi(i + 1, 0, i / 100000),
+  );
+  const item = addManifest(env, records);
+  await publish(env, item);
+  const expected = await call(env, "/api/osm/scan?lat=0&lng=0&limit=50");
+  const cold = { ...env };
+  env.coordinatorRequests.length = 0;
+  env.DATA.reads.length = 0;
+  env.cacheEntries.clear();
+  const results = await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      call(
+        cold,
+        `/api/osm/scan?lat=0&lng=${i / 1000000}&limit=50${i % 2 ? "&q=cafe" : ""}`,
+      ),
+    ),
+  );
+
+  for (const result of results) {
+    assert.equal(result.status, 200);
+    assert.equal(result.headers.get("X-Edge-Cache-Status"), "MISS");
+    assert.equal(result.body.revision, expected.body.revision);
+    assert.equal(result.body.count, 20);
+  }
+
+  assert.deepEqual(results[0].body, expected.body);
+  assert.deepEqual(env.coordinatorRequests, ["/admin/state"]);
+  assert.deepEqual(env.DATA.reads, [
+    `manifests/${item.digest}.json`,
+    `blocks/${Object.values(item.manifest.cells)[0][0]}.json`,
+  ]);
+});
+
+test("published state is memoised per isolate, refreshed by newer pins, publishes and expiry", async (context) => {
+  const env = environment();
+  const other = { ...env };
+  const records = [poi(2, 0, 0.00001), poi(3, 0, 0.00002)];
+  const one = await publish(env, addManifest(env, records));
+  const first = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(first.body.revision, one.body.revision);
+  assert.deepEqual(env.coordinatorRequests.slice(-1), ["/admin/state"]);
+  const two = await publish(
+    other,
+    addManifest(env, [poi(1, 0, 0), ...records], {
+      sourceTimestamp: "2026-09-12T00:00:00Z",
+    }),
+  );
+  const reads = env.coordinatorRequests.length;
+  const stale = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(stale.body.revision, one.body.revision);
+  assert.equal(stale.body.count, 2);
+  assert.equal(env.coordinatorRequests.length, reads);
+  const pinned = await call(
+    env,
+    `/api/osm/scan?lat=0&lng=0&revision=${two.body.revision}`,
+  );
+  assert.equal(pinned.status, 200);
+  assert.equal(pinned.body.count, 3);
+  assert.equal(env.coordinatorRequests.length, reads + 1);
+  const unpinned = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(unpinned.body.revision, two.body.revision);
+  assert.equal(env.coordinatorRequests.length, reads + 1);
+  const three = await publish(
+    other,
+    addManifest(env, records, { region: "second" }),
+  );
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  context.mock.timers.tick(10_001);
+  const expired = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(expired.body.revision, three.body.revision);
+  const own = await publish(
+    env,
+    addManifest(env, [poi(1, 0, 0)], {
+      region: "second",
+      sourceTimestamp: "2026-09-12T00:00:00Z",
+    }),
+  );
+  const visible = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(visible.body.revision, own.body.revision);
+});
+
+test("failed object loads are not memoised", async () => {
+  const env = environment();
+  const item = addManifest(env, [poi(1, 0, 0)]);
+  await publish(env, item);
+  const key = `blocks/${Object.values(item.manifest.cells)[0][0]}.json`;
+  const saved = env.DATA.stored(key);
+  env.DATA.entries.delete(key);
+  const missing = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(missing.status, 503);
+  env.DATA.entries.set(key, saved);
+  const restored = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(restored.status, 200);
+  assert.equal(restored.body.count, 1);
 });
 
 test("cache writes cannot turn successful queries into service errors", async () => {

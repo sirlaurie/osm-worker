@@ -42,4 +42,6 @@ Worker 同时读取 schema 1 的独立 JSON 小块和 schema 2 的打包数据�
 
 查询使用 R2 Range 读取所需小块，校验范围、长度及小块哈希后执行原有筛选和分页。Cache API 仍按小块哈希缓存，打包位置变化不使未变的小块缓存失效。查询接口、POI 数量和 0.01° 网格不变。
 
+查询路径在 Worker isolate 内缓存：当前发布清单缓存 10 秒，manifest 与小块按哈希缓存校验后的结果（分别上限 16 MiB 与 8 MiB，LRU 淘汰），并发请求共享同一次加载。经本 isolate 发布后立即失效；其他 isolate 最多 10 秒后看到新发布，携带更新 `revision` 的请求会立即刷新。
+
 先部署此 Worker，再升级 Builder 并提交 `osm update all --submit-only`；已发布的旧地区无需停服或清空存储。此格式升级保留旧对象，不执行 R2 列举或删除。

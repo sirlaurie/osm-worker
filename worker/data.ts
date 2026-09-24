@@ -490,3 +490,86 @@ export async function readImmutable(
 
   return { value, size: bytes.byteLength };
 }
+
+export interface Sized<T> {
+  value: T;
+  size: number;
+}
+
+export class Memo<T> {
+  private readonly entries = new Map<
+    string,
+    {
+      value: Promise<Sized<T>>;
+      size: number;
+      pending: boolean;
+      expires: number;
+    }
+  >();
+  private readonly limit: number;
+  private readonly ttl: number;
+  private bytes = 0;
+
+  constructor(limit: number, ttl = Number.POSITIVE_INFINITY) {
+    this.limit = limit;
+    this.ttl = ttl;
+  }
+
+  load(
+    key: string,
+    ctx: Pick<ExecutionContext, "waitUntil">,
+    read: () => Promise<Sized<T>>,
+    refresh = false,
+  ): Promise<Sized<T>> {
+    const hit = this.entries.get(key);
+
+    if (hit && (hit.pending || (!refresh && hit.expires > Date.now()))) {
+      this.entries.delete(key);
+      this.entries.set(key, hit);
+
+      return hit.value;
+    }
+
+    this.delete(key);
+    const entry = {
+      value: read(),
+      size: 0,
+      pending: true,
+      expires: Number.POSITIVE_INFINITY,
+    };
+    this.entries.set(key, entry);
+    ctx.waitUntil(
+      entry.value.then(
+        ({ size }) => {
+          entry.pending = false;
+          entry.expires = Date.now() + this.ttl;
+
+          if (this.entries.get(key) !== entry) return;
+
+          entry.size = size;
+          this.bytes += size;
+
+          for (const [name, item] of this.entries) {
+            if (this.bytes <= this.limit) break;
+
+            if (!item.pending) this.delete(name);
+          }
+        },
+        () => {
+          if (this.entries.get(key) === entry) this.entries.delete(key);
+        },
+      ),
+    );
+
+    return entry.value;
+  }
+
+  delete(key: string) {
+    const entry = this.entries.get(key);
+
+    if (!entry) return;
+
+    this.bytes -= entry.size;
+    this.entries.delete(key);
+  }
+}

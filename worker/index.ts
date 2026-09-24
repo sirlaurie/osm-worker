@@ -4,6 +4,8 @@ import {
   MAX_CURRENT,
   MAX_MANIFEST,
   MAX_QUERY_BYTES,
+  type Manifest,
+  Memo,
   type PackedBlock,
   type Poi,
   parseJSON,
@@ -18,6 +20,7 @@ import {
   validateManifest,
 } from "./data.ts";
 import {
+  type Bounds,
   type Coverage,
   cellFor,
   cellsForBounds,
@@ -29,6 +32,34 @@ import {
 import { formatPoi, type MatchedPoi, matchPoi } from "./poi.ts";
 
 export { Coordinator } from "./coordinator.ts";
+
+const PUBLISHED_TTL_MS = 10_000;
+const MANIFEST_MEMO_BYTES = 16 * 1024 * 1024;
+const BLOCK_MEMO_BYTES = 8 * 1024 * 1024;
+
+const memos = new WeakMap<
+  Env,
+  {
+    published: Memo<Current | null>;
+    manifests: Memo<{ manifest: Manifest; bbox: Bounds }>;
+    blocks: Memo<Poi[]>;
+  }
+>();
+
+function memo(env: Env) {
+  let value = memos.get(env);
+
+  if (!value) {
+    value = {
+      published: new Memo(0, PUBLISHED_TTL_MS),
+      manifests: new Memo(MANIFEST_MEMO_BYTES),
+      blocks: new Memo(BLOCK_MEMO_BYTES),
+    };
+    memos.set(env, value);
+  }
+
+  return value;
+}
 
 function json(value: unknown, status = 200): Response {
   return Response.json(value, {
@@ -103,6 +134,21 @@ async function readPublished(env: Env): Promise<Current | null> {
   return current;
 }
 
+async function published(
+  env: Env,
+  ctx: ExecutionContext,
+  refresh = false,
+): Promise<Current | null> {
+  const loaded = await memo(env).published.load(
+    "current",
+    ctx,
+    async () => ({ value: await readPublished(env), size: 0 }),
+    refresh,
+  );
+
+  return loaded.value;
+}
+
 async function query(
   url: URL,
   env: Env,
@@ -151,7 +197,10 @@ async function query(
 
   if (Array.from(name).length > 100) throw new ServiceError(400, "invalid_q");
 
-  const current = await readPublished(env);
+  let current = await published(env, ctx);
+
+  if (revision !== null && revision !== current?.revision)
+    current = await published(env, ctx, true);
 
   if (revision !== null && revision !== current?.revision)
     throw new ServiceError(409, "revision_conflict");
@@ -287,24 +336,40 @@ async function loadCandidates(
   let manifestBytes = 0;
 
   for (const release of releases) {
-    const loaded = await readImmutable(
-      env.DATA,
-      `manifests/${release.manifest}.json`,
+    const loaded = await memo(env).manifests.load(
       release.manifest,
-      Math.min(MAX_MANIFEST, MAX_QUERY_BYTES - manifestBytes),
-      url.origin,
       ctx,
-    );
-    manifestBytes += loaded.size;
-    validateManifest(loaded.value);
+      async () => {
+        const read = await readImmutable(
+          env.DATA,
+          `manifests/${release.manifest}.json`,
+          release.manifest,
+          MAX_MANIFEST,
+          url.origin,
+          ctx,
+        );
+        validateManifest(read.value);
 
-    const manifest = loaded.value;
-    const expected = releaseFor(manifest, release.manifest);
+        return {
+          value: {
+            manifest: read.value,
+            bbox: releaseFor(read.value, release.manifest).bbox,
+          },
+          size: read.size,
+        };
+      },
+    );
+
+    if (loaded.size > MAX_QUERY_BYTES - manifestBytes)
+      throw new ServiceError(503, "object_too_large");
+
+    manifestBytes += loaded.size;
+    const { manifest, bbox } = loaded.value;
 
     if (
       manifest.region !== release.region ||
       manifest.sourceTimestamp !== release.sourceTimestamp ||
-      expected.bbox.some((number, index) => number !== release.bbox[index])
+      bbox.some((number, index) => number !== release.bbox[index])
     )
       throw new ServiceError(503, "release_mismatch");
 
@@ -346,17 +411,25 @@ async function loadCandidates(
   let blockBytes = 0;
 
   for (const [hash, block] of blocks) {
-    const loaded = await readImmutable(
-      env.DATA,
-      `blocks/${hash}.json`,
-      hash,
-      Math.min(MAX_BLOCK, MAX_QUERY_BYTES - blockBytes),
-      url.origin,
-      ctx,
-      block.packed,
-    );
+    const loaded = await memo(env).blocks.load(hash, ctx, async () => {
+      const read = await readImmutable(
+        env.DATA,
+        `blocks/${hash}.json`,
+        hash,
+        MAX_BLOCK,
+        url.origin,
+        ctx,
+        block.packed,
+      );
+      validateBlock(read.value);
+
+      return { value: read.value, size: read.size };
+    });
+
+    if (loaded.size > MAX_QUERY_BYTES - blockBytes)
+      throw new ServiceError(503, "object_too_large");
+
     blockBytes += loaded.size;
-    validateBlock(loaded.value);
 
     for (const poi of loaded.value) {
       if (!block.cells.has(cellFor(poi.lat, poi.lon)))
@@ -384,8 +457,12 @@ export default {
 
       if (url.pathname.startsWith("/admin/")) {
         await authorize(request, env);
+        const response = await coordinator(env).fetch(request);
 
-        return await coordinator(env).fetch(request);
+        if (url.pathname === "/admin/publish" && response.ok)
+          memo(env).published.delete("current");
+
+        return response;
       }
 
       if (request.method !== "GET")
