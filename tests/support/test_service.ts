@@ -102,7 +102,7 @@ export async function startTestService(work: string) {
       return;
     }
 
-    if (request.method === "HEAD") {
+    if (request.method === "HEAD" || request.method === "GET") {
       if (
         request.headers["x-amz-content-sha256"] !==
         createHash("sha256").digest("hex")
@@ -112,7 +112,9 @@ export async function startTestService(work: string) {
         return;
       }
 
-      const object = await bucket.head(key);
+      const download =
+        request.method === "GET" ? await bucket.get(key) : undefined;
+      const object = download === undefined ? await bucket.head(key) : download;
 
       if (!object) response.writeHead(404).end();
       else
@@ -122,7 +124,9 @@ export async function startTestService(work: string) {
             "x-amz-meta-sha256": object.customMetadata?.sha256 ?? "",
             etag: object.etag,
           })
-          .end();
+          .end(
+            download ? Buffer.from(await download.arrayBuffer()) : undefined,
+          );
 
       return;
     }

@@ -19,6 +19,11 @@ export interface Poi {
   tags: Record<string, string>;
 }
 
+export interface ManifestSource {
+  provider: "geofabrik" | "osm-fr";
+  replicationUrl: string;
+}
+
 interface ManifestFields {
   region: string;
   sourceTimestamp: string;
@@ -26,6 +31,8 @@ interface ManifestFields {
   sourceSHA256: string;
   coverage: Coverage;
   count: number;
+  source?: ManifestSource;
+  excludedIncompleteRelationCount?: number;
 }
 
 export interface LegacyManifest extends ManifestFields {
@@ -183,6 +190,32 @@ function validCoverage(value: unknown): value is Coverage {
   return true;
 }
 
+function validSource(value: unknown): value is ManifestSource {
+  if (
+    !record(value) ||
+    Object.keys(value).some(
+      (key) => key !== "provider" && key !== "replicationUrl",
+    ) ||
+    typeof value.replicationUrl !== "string" ||
+    value.replicationUrl.length > 1024 ||
+    value.replicationUrl !== value.replicationUrl.trim()
+  )
+    return false;
+
+  const match =
+    value.provider === "geofabrik"
+      ? /^https:\/\/download\.geofabrik\.de\/([a-z0-9-]+(?:\/[a-z0-9-]+)*)-updates$/.exec(
+          value.replicationUrl,
+        )
+      : value.provider === "osm-fr"
+        ? /^https:\/\/download\.openstreetmap\.fr\/replication\/([a-z0-9_-]+(?:\/[a-z0-9_-]+)*)\/minute$/.exec(
+            value.replicationUrl,
+          )
+        : null;
+
+  return match !== null && match[1].length <= 512;
+}
+
 export function validateManifest(value: unknown): asserts value is Manifest {
   if (
     !record(value) ||
@@ -195,7 +228,10 @@ export function validateManifest(value: unknown): asserts value is Manifest {
     !HASH.test(value.sourceSHA256) ||
     !validCoverage(value.coverage) ||
     !record(value.cells) ||
-    !integer(value.count)
+    !integer(value.count) ||
+    (value.source !== undefined && !validSource(value.source)) ||
+    (value.excludedIncompleteRelationCount !== undefined &&
+      !integer(value.excludedIncompleteRelationCount))
   )
     throw new ServiceError(503, "invalid_manifest");
 

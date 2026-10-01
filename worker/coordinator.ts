@@ -4,6 +4,7 @@ import {
   MAX_CURRENT,
   MAX_MANIFEST,
   MAX_REGIONS,
+  type Manifest,
   parseJSON,
   REGION,
   readBytes,
@@ -251,6 +252,49 @@ function requireRunning(job: Job, now: number) {
     Date.parse(job.lease.expiresAt) <= now
   )
     throw new ServiceError(409, "lease_lost");
+}
+
+function validateSourceChange(
+  candidate: Manifest,
+  previous: Manifest,
+  extract: string,
+) {
+  const legacy = {
+    provider: "geofabrik",
+    replicationUrl: `https://download.geofabrik.de/${extract}-updates`,
+  };
+  const before = previous.source ?? legacy;
+  const after = candidate.source ?? legacy;
+
+  if (
+    before.provider === after.provider &&
+    before.replicationUrl === after.replicationUrl
+  )
+    return;
+
+  if (!candidate.source) throw new ServiceError(409, "source_required");
+
+  if (
+    Date.parse(candidate.sourceTimestamp) <=
+    Date.parse(previous.sourceTimestamp)
+  )
+    throw new ServiceError(409, "source_regression");
+
+  if (
+    candidate.coverage.type !== previous.coverage.type ||
+    JSON.stringify(candidate.coverage.coordinates) !==
+      JSON.stringify(previous.coverage.coordinates)
+  )
+    throw new ServiceError(409, "source_coverage_changed");
+
+  if (candidate.count < previous.count)
+    throw new ServiceError(409, "source_count_regression");
+
+  if (
+    (candidate.excludedIncompleteRelationCount ?? 0) >
+    (previous.excludedIncompleteRelationCount ?? 0)
+  )
+    throw new ServiceError(409, "source_relations_regression");
 }
 
 export class Coordinator {
@@ -679,6 +723,31 @@ export class Coordinator {
 
     if (value.region !== region) throw new ServiceError(400, "region_mismatch");
 
+    const inspected = (await loadCurrent(this.state.storage))?.regions.find(
+      (entry) => entry.region === region,
+    );
+    let previous: Manifest | null = null;
+
+    if (inspected) {
+      const { value: prior } = await readImmutable(
+        this.env.DATA,
+        `manifests/${inspected.manifest}.json`,
+        inspected.manifest,
+        MAX_MANIFEST,
+        origin,
+        this.state,
+      );
+      validateManifest(prior);
+
+      if (
+        prior.region !== region ||
+        prior.sourceTimestamp !== inspected.sourceTimestamp
+      )
+        throw new ServiceError(503, "invalid_current");
+
+      previous = prior;
+    }
+
     return this.state.storage.transaction(async (transaction) => {
       const now = Date.now();
       const job = await leaseJob(transaction, lease);
@@ -699,6 +768,26 @@ export class Coordinator {
       }
 
       requireRunning(job, now);
+
+      if (existing?.manifest !== inspected?.manifest)
+        throw new ServiceError(409, "current_changed");
+
+      if (value.source?.provider === "osm-fr") {
+        if (value.count === 0)
+          throw new ServiceError(409, "source_count_regression");
+
+        if ((value.excludedIncompleteRelationCount ?? 0) !== 0)
+          throw new ServiceError(409, "source_relations_regression");
+      }
+
+      if (
+        value.source?.provider === "geofabrik" &&
+        value.source.replicationUrl !==
+          `https://download.geofabrik.de/${job.extract}-updates`
+      )
+        throw new ServiceError(400, "source_extract_mismatch");
+
+      if (previous) validateSourceChange(value, previous, job.extract);
 
       if (
         existing &&

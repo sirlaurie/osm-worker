@@ -36,6 +36,14 @@ Worker 使用 `COORDINATOR` Durable Object 管理任务、设备租约和当前�
 
 Builder 命令与多设备操作见 [OSM Builder](../osm-builder/README.md#多设备处理)。本地检查使用 `npm run check`、`npm test`、`npm run build`。
 
+## 数据源切换的发布保护
+
+schema 1 与 schema 2 的 manifest 支持 `source: { provider, replicationUrl }`，`provider` 为 `geofabrik` 或 `osm-fr`。未声明 `source` 的历史 manifest 视为该任务地区的 Geofabrik 来源。来源地址限于 Geofabrik 的地区更新目录和 OSM France 的 minute 更新目录；Geofabrik 地址须与任务的 extract 一致。
+
+来源或增量地址变化时，候选 manifest 必须声明来源、数据时间晚于当前发布、coverage 类型及坐标一致、POI 数量不减少、`excludedIncompleteRelationCount` 不增加；历史清单缺少该计数时视为 0。当前版本来自 OSM France 时，缺少来源声明的旧 Builder 不能发布替换版本。同源发布保留时间相等的重打包行为。
+
+Worker 读取当前 manifest 后执行验收，在发布事务中复核当前 manifest 哈希及租约；当前版本变化返回 `409 current_changed`，调用方需读取发布状态并重试。未通过验收不改变当前发布和任务状态；通过验收的发布与任务完成共用一个事务。Current 结构、查询接口及地区 ID 不变，旧 manifest、数据块和 R2 `current.json` 不修改、不删除。部署此 Worker 后再启动支持切源的 Builder。
+
 ## R2 打包格式
 
 Worker 同时读取 schema 1 的独立 JSON 小块和 schema 2 的打包数据，支持各地区分批升级。schema 2 清单的 `packs` 是排序且唯一的 SHA-256 目录，`cells` 中每项为 `[小块哈希, 包编号, 偏移, 长度]`；对应对象为 `packs/<包哈希>.bin`，最大 1 MiB。

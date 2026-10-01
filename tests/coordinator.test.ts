@@ -5,7 +5,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { Miniflare } from "miniflare";
 import { localRuntime, workerConfig } from "../tools/runtime.ts";
-import type { Current, Manifest } from "../worker/data.ts";
+import type { Current, LegacyManifest, Manifest } from "../worker/data.ts";
 import { TEST_PUBLISH_TOKEN } from "./support/test_service.ts";
 
 interface Lease {
@@ -149,6 +149,7 @@ async function fixture(
   const manifest = async (
     region: string,
     sourceTimestamp = "2026-09-12T00:00:00Z",
+    fields: Partial<LegacyManifest> = {},
   ) => {
     const value: Manifest = {
       schema: 1,
@@ -170,6 +171,7 @@ async function fixture(
       },
       cells: {},
       count: 0,
+      ...fields,
     };
     const bytes = JSON.stringify(value);
     const digest = createHash("sha256").update(bytes).digest("hex");
@@ -233,6 +235,328 @@ test("the coordinator imports legacy R2 state once and persists authority across
   assert.equal(claimed.body.lease?.region, "missing");
   assert.equal(claimed.body.pending, 0);
   assert.equal(claimed.body.running, 1);
+});
+
+async function publishedFixture(
+  context: TestContext,
+  fields: Partial<LegacyManifest> = {},
+) {
+  const service = await fixture(context);
+  const hash = await service.manifest("a", "2026-09-12T00:00:00Z", fields);
+  const current: Current = {
+    schema: 1,
+    revision: randomUUID(),
+    regions: [
+      {
+        region: "a",
+        manifest: hash,
+        sourceTimestamp: "2026-09-12T00:00:00Z",
+        bbox: [-1, -1, 1, 1],
+      },
+    ],
+  };
+  await service.bucket.put("current.json", JSON.stringify(current));
+  assert.equal((await service.start(["a"])).status, 200);
+  const lease = (await service.claim(["a"])).body.lease;
+  assert(lease);
+
+  return { ...service, current, lease };
+}
+
+const franceSource = {
+  provider: "osm-fr",
+  replicationUrl:
+    "https://download.openstreetmap.fr/replication/europe/a/minute",
+} as const;
+
+const franceManifest = {
+  source: franceSource,
+  count: 1,
+  cells: { "9000_18000": ["b".repeat(64)] },
+};
+
+for (const [count, excluded, error] of [
+  [0, 0, "source_count_regression"],
+  [1, 1, "source_relations_regression"],
+] as const) {
+  test(`unpublished OSM France regions reject ${error} and keep their lease running`, async (context) => {
+    const service = await fixture(context);
+    assert.equal((await service.start(["a"])).status, 200);
+    const lease = (await service.claim(["a"])).body.lease;
+    assert(lease);
+    const manifest = await service.manifest("a", "2026-09-13T00:00:00Z", {
+      ...franceManifest,
+      count,
+      cells: count === 0 ? {} : franceManifest.cells,
+      excludedIncompleteRelationCount: excluded,
+    });
+    const rejected = await service.post("/admin/publish", {
+      region: "a",
+      manifest,
+      lease,
+    });
+    assert.equal(rejected.status, 409);
+    assert.equal(rejected.body.error, error);
+    assert.equal(await (await service.request("/admin/state")).json(), null);
+    assert.equal(
+      ((await (await service.request("/admin/jobs")).json()) as JobResponse)
+        .running,
+      1,
+    );
+  });
+}
+
+for (const scenario of [
+  {
+    name: "equal timestamps",
+    candidate: { sourceTimestamp: "2026-09-12T00:00:00Z" },
+    previous: {},
+    error: "source_regression",
+  },
+  {
+    name: "older timestamps",
+    candidate: { sourceTimestamp: "2026-09-11T00:00:00Z" },
+    previous: {},
+    error: "source_regression",
+  },
+  {
+    name: "changed coverage",
+    candidate: {
+      coverage: {
+        type: "Polygon",
+        coordinates: [
+          [
+            [0, 0],
+            [1, 0],
+            [1, 1],
+            [0, 1],
+            [0, 0],
+          ],
+        ],
+      },
+    },
+    previous: {},
+    error: "source_coverage_changed",
+  },
+  {
+    name: "fewer POIs",
+    candidate: {},
+    previous: { count: 2, cells: { "9000_18000": ["b".repeat(64)] } },
+    error: "source_count_regression",
+  },
+  {
+    name: "new incomplete relations",
+    candidate: { excludedIncompleteRelationCount: 1 },
+    previous: {},
+    error: "source_relations_regression",
+  },
+  {
+    name: "missing source declarations after OSM France",
+    candidate: { source: undefined },
+    previous: { source: franceSource },
+    error: "source_required",
+  },
+  {
+    name: "changed replication URLs with equal timestamps",
+    candidate: { sourceTimestamp: "2026-09-12T00:00:00Z" },
+    previous: {
+      source: {
+        ...franceSource,
+        replicationUrl:
+          "https://download.openstreetmap.fr/replication/europe/other/minute",
+      },
+    },
+    error: "source_regression",
+  },
+] satisfies {
+  name: string;
+  candidate: Partial<LegacyManifest>;
+  previous: Partial<LegacyManifest>;
+  error: string;
+}[]) {
+  test(`source changes reject ${scenario.name} without changing the published release`, async (context) => {
+    const service = await publishedFixture(context, scenario.previous);
+    const candidate = await service.manifest("a", "2026-09-13T00:00:00Z", {
+      ...franceManifest,
+      ...scenario.candidate,
+    });
+    const result = await service.post("/admin/publish", {
+      region: "a",
+      manifest: candidate,
+      lease: service.lease,
+    });
+    assert.equal(result.status, 409);
+    assert.equal(result.body.error, scenario.error);
+    assert.deepEqual(
+      await (await service.request("/admin/state")).json(),
+      service.current,
+    );
+    assert.equal(
+      ((await (await service.request("/admin/jobs")).json()) as JobResponse)
+        .running,
+      1,
+    );
+  });
+}
+
+test("a newer source with matching coverage and quality replaces a legacy release and preserves its objects", async (context) => {
+  const service = await publishedFixture(context);
+  const previous = await service.bucket.get(
+    `manifests/${service.current.regions[0].manifest}.json`,
+  );
+  assert(previous);
+  const previousBytes = await previous.text();
+  const candidate = await service.manifest("a", "2026-09-13T00:00:00Z", {
+    ...franceManifest,
+    excludedIncompleteRelationCount: 0,
+  });
+  const payload = { region: "a", manifest: candidate, lease: service.lease };
+  assert.equal((await service.post("/admin/publish", payload)).status, 200);
+  const current = (await (
+    await service.request("/admin/state")
+  ).json()) as Current;
+  assert.equal(current.regions[0].manifest, candidate);
+  assert.notEqual(current.revision, service.current.revision);
+  assert.equal((await service.post("/admin/publish", payload)).status, 200);
+  const retained = await service.bucket.get(
+    `manifests/${service.current.regions[0].manifest}.json`,
+  );
+  assert(retained);
+  assert.equal(await retained.text(), previousBytes);
+  assert.deepEqual(
+    await (await service.bucket.get("current.json"))?.json(),
+    service.current,
+  );
+});
+
+test("legacy and declared Geofabrik releases permit repacking at the same timestamp", async (context) => {
+  const service = await publishedFixture(context);
+  const candidate = await service.manifest("a", "2026-09-12T00:00:00Z", {
+    source: {
+      provider: "geofabrik",
+      replicationUrl: "https://download.geofabrik.de/test/a-updates",
+    },
+  });
+  assert.equal(
+    (
+      await service.post("/admin/publish", {
+        region: "a",
+        manifest: candidate,
+        lease: service.lease,
+      })
+    ).status,
+    200,
+  );
+  assert.equal((await service.start(["a"])).status, 200);
+  const lease = (await service.claim(["a"])).body.lease;
+  assert(lease);
+  assert.equal(
+    (
+      await service.post("/admin/publish", {
+        region: "a",
+        manifest: service.current.regions[0].manifest,
+        lease,
+      })
+    ).status,
+    200,
+  );
+});
+
+test("source declarations reject untrusted URLs and Geofabrik extract mismatches", async (context) => {
+  const service = await publishedFixture(context);
+
+  for (const source of [
+    {
+      provider: "geofabrik",
+      replicationUrl: "https://download.geofabrik.de/test/other-updates",
+    },
+    {
+      provider: "osm-fr",
+      replicationUrl: "http://download.openstreetmap.fr/replication/a/minute",
+    },
+    {
+      provider: "osm-fr",
+      replicationUrl:
+        "https://download.openstreetmap.fr.evil.test/replication/a/minute",
+    },
+    {
+      provider: "osm-fr",
+      replicationUrl:
+        "https://download.openstreetmap.fr/replication/../a/minute",
+    },
+    {
+      provider: "osm-fr",
+      replicationUrl:
+        "https://download.openstreetmap.fr/replication/a/minute?other=1",
+    },
+    {
+      provider: "osm-fr",
+      replicationUrl:
+        "https://download.openstreetmap.fr:443/replication/a/minute",
+    },
+    { provider: "geofabrik", replicationUrl: franceSource.replicationUrl },
+    { provider: "osm-fr", replicationUrl: `${franceSource.replicationUrl}\n` },
+  ] satisfies NonNullable<Manifest["source"]>[]) {
+    const candidate = await service.manifest("a", "2026-09-13T00:00:00Z", {
+      source,
+    });
+    const result = await service.post("/admin/publish", {
+      region: "a",
+      manifest: candidate,
+      lease: service.lease,
+    });
+    assert.equal(
+      result.body.error,
+      source.replicationUrl.endsWith("other-updates")
+        ? "source_extract_mismatch"
+        : "invalid_manifest",
+    );
+    assert.deepEqual(
+      await (await service.request("/admin/state")).json(),
+      service.current,
+    );
+  }
+});
+
+test("a replaced lease cannot win a source publication race against the new owner", async (context) => {
+  const service = await publishedFixture(context);
+  assert.equal(
+    (
+      await service.post("/admin/jobs/release", {
+        lease: service.lease,
+        outcome: "retry",
+      })
+    ).status,
+    200,
+  );
+  const replacement = (await service.claim(["a"])).body.lease;
+  assert(replacement);
+  const candidate = await service.manifest("a", "2026-09-13T00:00:00Z", {
+    ...franceManifest,
+  });
+  const stale = await service.manifest("a", "2026-09-14T00:00:00Z", {
+    ...franceManifest,
+  });
+  const [published, rejected] = await Promise.all([
+    service.post("/admin/publish", {
+      region: "a",
+      manifest: candidate,
+      lease: replacement,
+    }),
+    service.post("/admin/publish", {
+      region: "a",
+      manifest: stale,
+      lease: service.lease,
+    }),
+  ]);
+  assert.equal(published.status, 200);
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.body.error, "lease_lost");
+  const current = (await (
+    await service.request("/admin/state")
+  ).json()) as Current;
+  assert.equal(current.regions[0].manifest, candidate);
+  assert.equal(current.revision, published.body.revision);
 });
 
 test("initializing an empty coordinator does not import later R2 writes", async (context) => {

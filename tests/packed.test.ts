@@ -67,6 +67,54 @@ function packed(region: string, groups: Poi[][]) {
   return { manifest, bytes, digest, chunks };
 }
 
+test("manifest source requires bounded nonempty extract segments and known fields", () => {
+  const base = packed("test", [[record(1, 0)]]).manifest;
+
+  for (const [provider, prefix, suffix] of [
+    ["geofabrik", "https://download.geofabrik.de/", "-updates"],
+    ["osm-fr", "https://download.openstreetmap.fr/replication/", "/minute"],
+  ]) {
+    for (const extract of ["a".repeat(512), "region/extract"]) {
+      validateManifest({
+        ...base,
+        source: { provider, replicationUrl: `${prefix}${extract}${suffix}` },
+      });
+    }
+
+    for (const extract of [
+      "a".repeat(513),
+      "region//extract",
+      "region/",
+      "/region",
+    ]) {
+      assert.throws(
+        () =>
+          validateManifest({
+            ...base,
+            source: {
+              provider,
+              replicationUrl: `${prefix}${extract}${suffix}`,
+            },
+          }),
+        { code: "invalid_manifest" },
+      );
+    }
+
+    assert.throws(
+      () =>
+        validateManifest({
+          ...base,
+          source: {
+            provider,
+            replicationUrl: `${prefix}region/extract${suffix}`,
+            unexpected: true,
+          },
+        }),
+      { code: "invalid_manifest" },
+    );
+  }
+});
+
 test("schema 2 requires complete compact references with contiguous bounded pack ranges", () => {
   const base = packed("test", [[record(1, 0)], [record(2, 0.0001)]]).manifest;
   validateManifest(base);
