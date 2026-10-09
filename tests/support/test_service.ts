@@ -79,7 +79,7 @@ export async function startTestService(work: string) {
 
     if (
       !key ||
-      !/^((blocks|manifests)\/[a-f0-9]{64}\.json|packs\/[a-f0-9]{64}\.bin)$/.test(
+      !/^((blocks|manifests|indexes)\/[a-f0-9]{64}\.json|packs\/[a-f0-9]{64}\.bin)$/.test(
         key,
       )
     ) {

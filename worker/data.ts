@@ -14,6 +14,7 @@ export const MAX_REGIONS = 256;
 export const MAX_MANIFEST = 8 * 1024 * 1024;
 export const MAX_BLOCK = 262144;
 export const MAX_PACK = 1024 * 1024;
+export const MAX_INDEX = 1024 * 1024;
 export const MAX_QUERY_BYTES = 16 * 1024 * 1024;
 export const MAX_COVERAGE_POINTS = 100000;
 
@@ -59,7 +60,19 @@ export interface PackedManifest extends ManifestFields {
   packs: string[];
 }
 
-export type Manifest = LegacyManifest | PackedManifest;
+export interface IndexedManifest extends ManifestFields {
+  schema: 3;
+  packs: string[];
+  groups: Record<string, string>;
+}
+
+export type Manifest = LegacyManifest | PackedManifest | IndexedManifest;
+
+export interface GroupIndex {
+  group: string;
+  packs: string[];
+  cells: Record<string, PackedPage[]>;
+}
 
 export interface PackedBlock {
   pack: string;
@@ -222,10 +235,94 @@ function validSource(value: unknown): value is ManifestSource {
   return match !== null && match[1].length <= 512;
 }
 
+function gridKey(value: string, maximumY: number, maximumX: number): boolean {
+  const match = /^(0|[1-9]\d*)_(0|[1-9]\d*)$/.exec(value);
+
+  return (
+    match !== null &&
+    Number(match[1]) <= maximumY &&
+    Number(match[2]) <= maximumX
+  );
+}
+
+function sortedHashes(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (hash, index, hashes) =>
+        typeof hash === "string" &&
+        HASH.test(hash) &&
+        (index === 0 || hashes[index - 1] < hash),
+    )
+  );
+}
+
+export function groupFor(cell: string): string {
+  const [y, x] = cell.split("_").map(Number);
+
+  return `${Math.floor(y / 16)}_${Math.floor(x / 16)}`;
+}
+
+function validatePackedCells(
+  cells: Record<string, unknown>,
+  packs: string[],
+  code: string,
+  group?: string,
+): asserts cells is Record<string, PackedPage[]> {
+  const references = new Set<string>();
+  const ranges = new Map<number, { offset: number; length: number }[]>();
+
+  for (const [cell, pages] of Object.entries(cells)) {
+    if (
+      !gridKey(cell, 17999, 35999) ||
+      (group !== undefined && groupFor(cell) !== group) ||
+      !Array.isArray(pages) ||
+      pages.length === 0
+    )
+      throw new ServiceError(503, code);
+
+    for (const page of pages) {
+      if (
+        !Array.isArray(page) ||
+        page.length !== 4 ||
+        typeof page[0] !== "string" ||
+        !HASH.test(page[0]) ||
+        references.has(page[0]) ||
+        !integer(page[1]) ||
+        !integer(page[2]) ||
+        !integer(page[3]) ||
+        page[1] >= packs.length ||
+        page[3] < 1 ||
+        page[3] > MAX_BLOCK ||
+        page[2] + page[3] > MAX_PACK
+      )
+        throw new ServiceError(503, code);
+
+      references.add(page[0]);
+      const slices = ranges.get(page[1]) ?? [];
+      slices.push({ offset: page[2], length: page[3] });
+      ranges.set(page[1], slices);
+    }
+  }
+
+  if (packs.length !== ranges.size) throw new ServiceError(503, code);
+
+  for (const slices of ranges.values()) {
+    slices.sort((a, b) => a.offset - b.offset);
+    let end = 0;
+
+    for (const range of slices) {
+      if (range.offset !== end) throw new ServiceError(503, code);
+
+      end += range.length;
+    }
+  }
+}
+
 export function validateManifest(value: unknown): asserts value is Manifest {
   if (
     !record(value) ||
-    (value.schema !== 1 && value.schema !== 2) ||
+    (value.schema !== 1 && value.schema !== 2 && value.schema !== 3) ||
     typeof value.region !== "string" ||
     !REGION.test(value.region) ||
     !timestamp(value.sourceTimestamp) ||
@@ -233,7 +330,9 @@ export function validateManifest(value: unknown): asserts value is Manifest {
     typeof value.sourceSHA256 !== "string" ||
     !HASH.test(value.sourceSHA256) ||
     !validCoverage(value.coverage) ||
-    !record(value.cells) ||
+    (value.schema === 3
+      ? value.cells !== undefined || !record(value.groups)
+      : !record(value.cells)) ||
     !integer(value.count) ||
     (value.source !== undefined && !validSource(value.source)) ||
     (value.excludedIncompleteRelationCount !== undefined &&
@@ -242,84 +341,69 @@ export function validateManifest(value: unknown): asserts value is Manifest {
     throw new ServiceError(503, "invalid_manifest");
 
   if (
-    value.schema === 2
-      ? !Array.isArray(value.packs) ||
-        !value.packs.every(
-          (hash, index, hashes) =>
-            typeof hash === "string" &&
-            HASH.test(hash) &&
-            (index === 0 || hashes[index - 1] < hash),
-        )
-      : value.packs !== undefined &&
+    value.schema === 1
+      ? value.packs !== undefined &&
         (!Array.isArray(value.packs) || value.packs.length !== 0)
+      : !sortedHashes(value.packs)
   )
     throw new ServiceError(503, "invalid_manifest");
 
-  const references = new Set<string>();
-  const ranges = new Map<number, { offset: number; length: number }[]>();
-
-  for (const [cell, pages] of Object.entries(value.cells)) {
-    const match = /^(0|[1-9]\d*)_(0|[1-9]\d*)$/.exec(cell);
+  if (value.schema === 3) {
+    const groups = value.groups as Record<string, unknown>;
 
     if (
-      !match ||
-      Number(match[1]) > 17999 ||
-      Number(match[2]) > 35999 ||
-      !Array.isArray(pages) ||
-      pages.length === 0
+      !Object.entries(groups).every(
+        ([group, hash]) =>
+          gridKey(group, 1124, 2249) &&
+          typeof hash === "string" &&
+          HASH.test(hash),
+      ) ||
+      (Object.keys(groups).length === 0) !== (value.count === 0) ||
+      ((value.packs as string[]).length === 0) !== (value.count === 0)
     )
       throw new ServiceError(503, "invalid_manifest");
 
-    if (value.schema === 1) {
-      if (
-        !pages.every((hash) => typeof hash === "string" && HASH.test(hash)) ||
-        new Set(pages).size !== pages.length
-      )
-        throw new ServiceError(503, "invalid_manifest");
-    } else {
-      for (const page of pages) {
-        if (
-          !Array.isArray(page) ||
-          page.length !== 4 ||
-          typeof page[0] !== "string" ||
-          !HASH.test(page[0]) ||
-          references.has(page[0]) ||
-          !integer(page[1]) ||
-          !integer(page[2]) ||
-          !integer(page[3]) ||
-          page[1] >= (value.packs as string[]).length ||
-          page[3] < 1 ||
-          page[3] > MAX_BLOCK ||
-          page[2] + page[3] > MAX_PACK
-        )
-          throw new ServiceError(503, "invalid_manifest");
-
-        references.add(page[0]);
-        const slices = ranges.get(page[1]) ?? [];
-        slices.push({ offset: page[2], length: page[3] });
-        ranges.set(page[1], slices);
-      }
-    }
+    return;
   }
 
-  if ((Object.keys(value.cells).length === 0) !== (value.count === 0))
+  const cells = value.cells as Record<string, unknown>;
+
+  if ((Object.keys(cells).length === 0) !== (value.count === 0))
     throw new ServiceError(503, "invalid_manifest");
 
-  if (value.schema === 1) return;
+  if (value.schema === 2) {
+    validatePackedCells(cells, value.packs as string[], "invalid_manifest");
 
-  if ((value.packs as string[]).length !== ranges.size)
-    throw new ServiceError(503, "invalid_manifest");
-
-  for (const slices of ranges.values()) {
-    slices.sort((a, b) => a.offset - b.offset);
-    let end = 0;
-
-    for (const range of slices) {
-      if (range.offset !== end) throw new ServiceError(503, "invalid_manifest");
-
-      end += range.length;
-    }
+    return;
   }
+
+  for (const [cell, pages] of Object.entries(cells)) {
+    if (
+      !gridKey(cell, 17999, 35999) ||
+      !Array.isArray(pages) ||
+      pages.length === 0 ||
+      !pages.every((hash) => typeof hash === "string" && HASH.test(hash)) ||
+      new Set(pages).size !== pages.length
+    )
+      throw new ServiceError(503, "invalid_manifest");
+  }
+}
+
+export function validateIndex(
+  value: unknown,
+  group: string,
+): asserts value is GroupIndex {
+  if (
+    !record(value) ||
+    value.group !== group ||
+    !sortedHashes(value.packs) ||
+    value.packs.length === 0 ||
+    !record(value.cells) ||
+    Object.keys(value.cells).length === 0
+  )
+    throw new ServiceError(503, "invalid_index");
+
+  validatePackedCells(value.cells, value.packs, "invalid_index", group);
 }
 
 export function validateCurrent(value: unknown): asserts value is Current {

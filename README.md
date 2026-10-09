@@ -52,7 +52,9 @@ Worker 读取当前 manifest 后执行验收，在发布事务中复核当前 ma
 
 ## R2 打包格式
 
-Worker 同时读取 schema 1 的独立 JSON 小块和 schema 2 的打包数据，支持各地区分批升级。schema 2 清单的 `packs` 是排序且唯一的 SHA-256 目录，`cells` 中每项为 `[小块哈希, 包编号, 偏移, 长度]`；对应对象为 `packs/<包哈希>.bin`，最大 1 MiB。
+Worker 同时读取 schema 1 的独立 JSON 小块、schema 2 的打包数据和 schema 3 的分组索引，支持各地区分批升级。schema 2 清单的 `packs` 是排序且唯一的 SHA-256 目录，`cells` 中每项为 `[小块哈希, 包编号, 偏移, 长度]`；对应对象为 `packs/<包哈希>.bin`，最大 1 MiB。
+
+schema 3 的 manifest 不再包含 `cells`，改为 `groups`：键是 16 × 16 网格组编号 `<纬度格号 ÷ 16>_<经度格号 ÷ 16>`，值是该组索引对象 `indexes/<哈希>.json` 的 SHA-256。索引对象最大 1 MiB，包含 `group`、本组用到的 `packs` 和本组的 `cells`，格式与 schema 2 相同。manifest 的 `packs` 列出全部索引用到的包，`osm gc` 据此判断哪些包仍在使用；Worker 拒绝 `group` 与键不符、或使用未列出包的索引。查询只读取所需网格组的索引，manifest 的大小不再随地区面积增长。
 
 查询使用 R2 Range 读取所需小块，校验范围、长度及小块哈希后执行原有筛选和分页。Cache API 仍按小块哈希缓存，打包位置变化不使未变的小块缓存失效。查询接口、POI 数量和 0.01° 网格不变。
 

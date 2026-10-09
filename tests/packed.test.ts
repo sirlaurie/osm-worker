@@ -6,6 +6,9 @@ import test from "node:test";
 import { localRuntime } from "../tools/runtime.ts";
 import type { Lease } from "../worker/coordinator.ts";
 import {
+  type GroupIndex,
+  groupFor,
+  type IndexedManifest,
   type LegacyManifest,
   MAX_BLOCK,
   MAX_PACK,
@@ -14,6 +17,7 @@ import {
   type PackedManifest,
   type Poi,
   readImmutable,
+  validateIndex,
   validateManifest,
 } from "../worker/data.ts";
 import { cellFor } from "../worker/geo.ts";
@@ -66,6 +70,109 @@ function packed(region: string, groups: Poi[][]) {
 
   return { manifest, bytes, digest, chunks };
 }
+
+function indexed(region: string, blocks: Poi[][]) {
+  const spatial = new Map<string, Poi[][]>();
+
+  for (const block of blocks) {
+    const group = groupFor(cellFor(block[0].lat, block[0].lon));
+    spatial.set(group, [...(spatial.get(group) ?? []), block]);
+  }
+
+  const objects = new Map<string, Buffer>();
+  const manifest: IndexedManifest = {
+    schema: 3,
+    region,
+    sourceTimestamp: "2026-09-12T00:00:00Z",
+    sourceSequence: 1,
+    sourceSHA256: "a".repeat(64),
+    coverage: {
+      type: "Polygon",
+      coordinates: [
+        [
+          [-1, -1],
+          [1, -1],
+          [1, 1],
+          [-1, 1],
+          [-1, -1],
+        ],
+      ],
+    },
+    packs: [],
+    groups: {},
+    count: blocks.flat().length,
+  };
+  const indexes = new Map<string, GroupIndex>();
+
+  for (const [group, members] of spatial) {
+    const item = packed(region, members);
+    objects.set(`packs/${item.digest}.bin`, item.bytes);
+    const index: GroupIndex = {
+      group,
+      packs: [item.digest],
+      cells: item.manifest.cells,
+    };
+    const bytes = Buffer.from(JSON.stringify(index));
+    const digest = hash(bytes);
+    objects.set(`indexes/${digest}.json`, bytes);
+    indexes.set(group, index);
+    manifest.groups[group] = digest;
+    manifest.packs.push(item.digest);
+  }
+
+  manifest.packs.sort();
+
+  return { manifest, objects, indexes };
+}
+
+test("schema 3 indexes belong to their group, use listed packs and keep contiguous ranges", () => {
+  const item = indexed("test", [[record(1, 0)], [record(2, 0.2)]]);
+  validateManifest(item.manifest);
+  validateManifest({ ...item.manifest, packs: [], groups: {}, count: 0 });
+  const [group, index] = [...item.indexes][0];
+  validateIndex(index, group);
+  const page = Object.values(index.cells)[0][0];
+  const cases: [string, unknown, string][] = [
+    ["manifest with cells", { ...item.manifest, cells: {} }, "manifest"],
+    ["manifest without groups", { ...item.manifest, groups: [] }, "manifest"],
+    [
+      "group outside the grid",
+      { ...item.manifest, groups: { "1125_2250": "a".repeat(64) } },
+      "manifest",
+    ],
+    [
+      "groups without places",
+      { ...item.manifest, count: 0, packs: [] },
+      "manifest",
+    ],
+    ["index for another group", { ...index, group: "0_0" }, "index"],
+    ["cell outside the group", { ...index, cells: { "0_0": [page] } }, "index"],
+    [
+      "unused pack",
+      { ...index, packs: [...index.packs, "f".repeat(64)] },
+      "index",
+    ],
+    [
+      "gap in pack range",
+      {
+        ...index,
+        cells: { [Object.keys(index.cells)[0]]: [[page[0], 0, 1, page[3]]] },
+      },
+      "index",
+    ],
+    ["empty index", { ...index, cells: {} }, "index"],
+  ];
+
+  for (const [name, value, kind] of cases)
+    assert.throws(
+      () =>
+        kind === "manifest"
+          ? validateManifest(value)
+          : validateIndex(value, group),
+      { code: `invalid_${kind}` },
+      name,
+    );
+});
 
 test("manifest source requires bounded nonempty extract segments and known fields", () => {
   const base = packed("test", [[record(1, 0)]]).manifest;
@@ -457,6 +564,112 @@ test("Miniflare queries old and packed regions together and reuses logical cache
     ((await rejected.json()) as { error: string }).error,
     "corrupt_object",
   );
+});
+
+test("Miniflare reads only the group indexes a schema 3 query needs and rejects foreign indexes", async (context) => {
+  await mkdir(".build/tests", { recursive: true });
+  const work = await mkdtemp(path.resolve(".build/tests/indexed-"));
+  const runtime = await localRuntime(work, TEST_PUBLISH_TOKEN);
+  context.after(async () => {
+    await runtime.dispose();
+    await rm(work, { recursive: true, force: true });
+  });
+  const bucket = await runtime.getR2Bucket("DATA");
+  const caches = await runtime.getCaches();
+  const post = async (path: string, value: unknown) => {
+    const response = await runtime.dispatchFetch(
+      `https://indexed.test${path}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TEST_PUBLISH_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(value),
+      },
+    );
+    assert.equal(response.status, 200, await response.clone().text());
+
+    return (await response.json()) as { lease: Lease };
+  };
+  const publish = async (item: ReturnType<typeof indexed>) => {
+    for (const [key, bytes] of item.objects) await bucket.put(key, bytes);
+
+    const bytes = Buffer.from(JSON.stringify(item.manifest));
+    await bucket.put(`manifests/${hash(bytes)}.json`, bytes);
+    await post("/admin/jobs/start", {
+      requestId: randomUUID(),
+      mode: "update",
+      regions: [
+        { id: item.manifest.region, extract: `test/${item.manifest.region}` },
+      ],
+    });
+    const { lease } = await post("/admin/jobs/claim", {
+      deviceId: randomUUID(),
+      requestId: randomUUID(),
+      slot: 0,
+      localRegions: [item.manifest.region],
+    });
+    await post("/admin/publish", {
+      region: item.manifest.region,
+      manifest: hash(bytes),
+      lease,
+    });
+  };
+  const query = async (lng: number) => {
+    const response = await runtime.dispatchFetch(
+      `https://indexed.test/api/osm/scan?lat=0&lng=${lng}&limit=10`,
+    );
+
+    return {
+      status: response.status,
+      body: (await response.json()) as {
+        error: string;
+        coverage: string;
+        results: { name: string }[];
+      },
+    };
+  };
+  const item = indexed("indexed", [
+    [record(1, 0, "Near cafe"), record(2, 0.0001, "Next cafe")],
+    [record(3, 0.2, "Far cafe")],
+  ]);
+  await publish(item);
+  const near = await query(0);
+  assert.equal(near.status, 200);
+  assert.equal(near.body.coverage, "covered");
+  assert.deepEqual(
+    near.body.results.map((poi) => poi.name),
+    ["Near cafe", "Next cafe"],
+  );
+  const cached = async (group: string) =>
+    (await caches.default.match(
+      `https://indexed.test/__objects/indexes/${item.manifest.groups[group]}.json`,
+    )) !== undefined;
+  assert.equal(await cached(groupFor("9000_18000")), true);
+  assert.equal(await cached(groupFor("9000_18020")), false);
+  assert.deepEqual(
+    (await query(0.2)).body.results.map((poi) => poi.name),
+    ["Far cafe"],
+  );
+
+  const swapped = indexed("swapped", [[record(4, 0.4)], [record(5, 0.6)]]);
+  const [first, second] = Object.keys(swapped.manifest.groups);
+  [swapped.manifest.groups[first], swapped.manifest.groups[second]] = [
+    swapped.manifest.groups[second],
+    swapped.manifest.groups[first],
+  ];
+  await publish(swapped);
+  const foreign = await query(0.4);
+  assert.equal(foreign.status, 503);
+  assert.equal(foreign.body.error, "invalid_index");
+
+  const unlisted = indexed("unlisted", [[record(6, -0.4)]]);
+  unlisted.manifest.packs = ["0".repeat(64)];
+  await publish(unlisted);
+  const missing = await query(-0.4);
+  assert.equal(missing.status, 503);
+  assert.equal(missing.body.error, "invalid_index");
 });
 
 test("object memo evicts least recently used settled entries past its byte limit", async () => {

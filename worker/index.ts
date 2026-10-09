@@ -1,12 +1,16 @@
 import {
   type Current,
+  type GroupIndex,
+  groupFor,
   MAX_BLOCK,
   MAX_CURRENT,
+  MAX_INDEX,
   MAX_MANIFEST,
   MAX_QUERY_BYTES,
   type Manifest,
   Memo,
   type PackedBlock,
+  type PackedPage,
   type Poi,
   parseJSON,
   readBytes,
@@ -17,6 +21,7 @@ import {
   UUID,
   validateBlock,
   validateCurrent,
+  validateIndex,
   validateManifest,
 } from "./data.ts";
 import {
@@ -35,13 +40,15 @@ export { Coordinator } from "./coordinator.ts";
 
 const PUBLISHED_TTL_MS = 10_000;
 const MANIFEST_MEMO_BYTES = 16 * 1024 * 1024;
+const INDEX_MEMO_BYTES = 8 * 1024 * 1024;
 const BLOCK_MEMO_BYTES = 8 * 1024 * 1024;
 
 const memos = new WeakMap<
   Env,
   {
     published: Memo<Current | null>;
-    manifests: Memo<{ manifest: Manifest; bbox: Bounds }>;
+    manifests: Memo<{ manifest: Manifest; bbox: Bounds; packs: Set<string> }>;
+    indexes: Memo<GroupIndex>;
     blocks: Memo<Poi[]>;
   }
 >();
@@ -53,6 +60,7 @@ function memo(env: Env) {
     value = {
       published: new Memo(0, PUBLISHED_TTL_MS),
       manifests: new Memo(MANIFEST_MEMO_BYTES),
+      indexes: new Memo(INDEX_MEMO_BYTES),
       blocks: new Memo(BLOCK_MEMO_BYTES),
     };
     memos.set(env, value);
@@ -307,6 +315,20 @@ async function query(
   return response;
 }
 
+function packedPages(
+  source: { cells: Record<string, PackedPage[]>; packs: string[] } | undefined,
+  cell: string,
+): { hash: string; packed: PackedBlock }[] {
+  if (!source) return [];
+
+  return (source.cells[cell] ?? []).map(
+    ([hash, packIndex, offset, length]) => ({
+      hash,
+      packed: { pack: source.packs[packIndex], offset, length },
+    }),
+  );
+}
+
 async function loadCandidates(
   url: URL,
   env: Env,
@@ -358,6 +380,7 @@ async function loadCandidates(
           value: {
             manifest: read.value,
             bbox: releaseFor(read.value, release.manifest).bbox,
+            packs: new Set(read.value.packs ?? []),
           },
           size: read.size,
         };
@@ -368,7 +391,7 @@ async function loadCandidates(
       throw new ServiceError(503, "object_too_large");
 
     manifestBytes += loaded.size;
-    const { manifest, bbox } = loaded.value;
+    const { manifest, bbox, packs } = loaded.value;
 
     if (
       manifest.region !== release.region ||
@@ -378,6 +401,42 @@ async function loadCandidates(
       throw new ServiceError(503, "release_mismatch");
 
     coverages.push(manifest.coverage);
+    const indexes = new Map<string, GroupIndex>();
+
+    if (manifest.schema === 3) {
+      for (const group of new Set(cells.map(groupFor))) {
+        const hash = manifest.groups[group];
+
+        if (!hash) continue;
+
+        const index = await memo(env).indexes.load(hash, ctx, async () => {
+          const read = await readImmutable(
+            env.DATA,
+            `indexes/${hash}.json`,
+            hash,
+            MAX_INDEX,
+            url.origin,
+            ctx,
+          );
+          validateIndex(read.value, group);
+
+          return { value: read.value, size: read.size };
+        });
+
+        if (index.size > MAX_QUERY_BYTES - manifestBytes)
+          throw new ServiceError(503, "object_too_large");
+
+        manifestBytes += index.size;
+
+        if (
+          index.value.group !== group ||
+          !index.value.packs.every((pack) => packs.has(pack))
+        )
+          throw new ServiceError(503, "invalid_index");
+
+        indexes.set(group, index.value);
+      }
+    }
 
     for (const cell of cells) {
       const pages =
@@ -386,11 +445,9 @@ async function loadCandidates(
               hash,
               packed: undefined,
             }))
-          : (manifest.cells[cell] ?? []).map(
-              ([hash, packIndex, offset, length]) => ({
-                hash,
-                packed: { pack: manifest.packs[packIndex], offset, length },
-              }),
+          : packedPages(
+              manifest.schema === 2 ? manifest : indexes.get(groupFor(cell)),
+              cell,
             );
 
       for (const { hash, packed } of pages) {
