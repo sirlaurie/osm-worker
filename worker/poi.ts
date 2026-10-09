@@ -1,4 +1,4 @@
-import { type Poi, ServiceError } from "./data.ts";
+import type { Poi } from "./data.ts";
 import { distanceMeters } from "./geo.ts";
 
 export interface PoiItem {
@@ -168,7 +168,11 @@ export function matchPoi(
   const classification = classifyOsmTags(poi.tags);
   const name = names[0];
 
-  if (!name || !classification) throw new ServiceError(503, "invalid_poi");
+  if (!name || !classification) {
+    console.warn(JSON.stringify({ event: "invalid_poi", id: poi.id }));
+
+    return null;
+  }
 
   const distance = distanceMeters(lat, lon, poi.lat, poi.lon);
 

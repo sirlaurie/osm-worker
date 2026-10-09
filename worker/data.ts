@@ -1,4 +1,9 @@
-import { type Bounds, type Coverage, coverageBounds } from "./geo.ts";
+import {
+  type Bounds,
+  type Coverage,
+  coverageBounds,
+  coverageBoxes,
+} from "./geo.ts";
 
 export const HASH = /^[a-f0-9]{64}$/;
 export const REGION = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -67,6 +72,7 @@ export interface RegionRelease {
   manifest: string;
   sourceTimestamp: string;
   bbox: Bounds;
+  boxes?: Bounds[];
 }
 
 export interface Current {
@@ -338,7 +344,11 @@ export function validateCurrent(value: unknown): asserts value is Current {
       typeof entry.manifest !== "string" ||
       !HASH.test(entry.manifest) ||
       !timestamp(entry.sourceTimestamp) ||
-      !validBounds(entry.bbox)
+      !validBounds(entry.bbox) ||
+      (entry.boxes !== undefined &&
+        (!Array.isArray(entry.boxes) ||
+          entry.boxes.length === 0 ||
+          !entry.boxes.every(validBounds)))
     )
       throw new ServiceError(503, "invalid_current");
 
@@ -369,11 +379,14 @@ export function validateBlock(value: unknown): asserts value is Poi[] {
 }
 
 export function releaseFor(manifest: Manifest, hash: string): RegionRelease {
+  const boxes = coverageBoxes(manifest.coverage);
+
   return {
     region: manifest.region,
     manifest: hash,
     sourceTimestamp: manifest.sourceTimestamp,
     bbox: coverageBounds(manifest.coverage),
+    ...(boxes ? { boxes } : {}),
   };
 }
 

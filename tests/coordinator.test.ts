@@ -28,6 +28,7 @@ interface JobResponse {
   pending: number;
   running: number;
   failed: number;
+  removed: string[];
 }
 
 async function seedCoordinator(work: string, records: Record<string, unknown>) {
@@ -522,13 +523,13 @@ test("a replaced lease cannot win a source publication race against the new owne
   const service = await publishedFixture(context);
   assert.equal(
     (
-      await service.post("/admin/jobs/release", {
-        lease: service.lease,
-        outcome: "retry",
+      await service.post("/admin/jobs/cancel", {
+        batchId: service.lease.batchId,
       })
     ).status,
     200,
   );
+  assert.equal((await service.start(["a"])).status, 200);
   const replacement = (await service.claim(["a"])).body.lease;
   assert(replacement);
   const candidate = await service.manifest("a", "2026-09-13T00:00:00Z", {
@@ -766,7 +767,13 @@ test("retry release returns only its region to pending and fences the returned l
     (await service.post("/admin/jobs/release", { lease: second })).status,
     400,
   );
-  const retry = { lease: second, outcome: "retry" };
+  const retry = {
+    lease: second,
+    outcome: "retry",
+    error: "Source download failed: HTTP 404",
+    retryAfterSeconds: 600,
+  };
+  const releasedAt = Date.now();
   assert.equal((await service.post("/admin/jobs/release", retry)).status, 200);
   assert.equal((await service.post("/admin/jobs/release", retry)).status, 200);
   assert.equal(
@@ -794,29 +801,165 @@ test("retry release returns only its region to pending and fences the returned l
     ).status,
     409,
   );
-  const reassigned = (await service.claim([])).body.lease;
-  assert(reassigned);
-  assert.equal(reassigned.region, second.region);
-  assert(reassigned.generation > second.generation);
-  assert.equal((await service.post("/admin/jobs/release", retry)).status, 409);
-  assert.equal(
-    (await service.post("/admin/jobs/renew", { lease: reassigned })).status,
-    200,
-  );
+  assert.equal((await service.claim([])).body.lease, null);
+  const jobs = (await (await service.request("/admin/jobs")).json()) as {
+    jobs: {
+      region: string;
+      status: string;
+      retries: number;
+      notBefore: string;
+      lastError: string;
+    }[];
+  };
+  const deferred = jobs.jobs.find((job) => job.region === second.region);
+  assert(deferred);
+  assert.equal(deferred.status, "pending");
+  assert.equal(deferred.retries, 1);
+  assert.equal(deferred.lastError, retry.error);
+  assert(Date.parse(deferred.notBefore) >= releasedAt + 600_000);
   assert.equal(
     (await service.post("/admin/jobs/renew", { lease: first })).status,
     200,
   );
+});
+
+test("retry releases are claimable only after their deferral and grow per region", async (context) => {
+  const batchId = randomUUID();
+  const now = Date.now();
+  const job = {
+    extract: "test/a",
+    status: "pending",
+    generation: 1,
+    lastOwner: null,
+    lease: null,
+    manifest: null,
+    updatedAt: new Date(now - 600_000).toISOString(),
+  };
+  const service = await fixture(context, {
+    migration_complete: true,
+    lease_slots_migrated: true,
+    current: null,
+    active_batch: batchId,
+    [`batch:${batchId}`]: {
+      batchId,
+      requestId: randomUUID(),
+      mode: "update",
+      regions: ["a", "b"],
+      createdAt: new Date(now - 600_000).toISOString(),
+      finishedAt: null,
+    },
+    [`job:${batchId}:a`]: {
+      ...job,
+      region: "a",
+      retries: 3,
+      notBefore: new Date(now + 600_000).toISOString(),
+    },
+    [`job:${batchId}:b`]: {
+      ...job,
+      region: "b",
+      extract: "test/b",
+      retries: 3,
+      notBefore: new Date(now - 1_000).toISOString(),
+    },
+    "generation:a": 1,
+    "generation:b": 1,
+  });
+  const deviceId = randomUUID();
+  const lease = (await service.claim([], deviceId)).body.lease;
+  assert(lease);
+  assert.equal(lease.region, "b");
+  assert.equal(
+    (await service.claim([], deviceId, randomUUID(), 1)).body.lease,
+    null,
+  );
+  const releasedAt = Date.now();
   assert.equal(
     (
-      await service.post("/admin/publish", {
-        region: second.region,
-        manifest: digest,
-        lease: reassigned,
+      await service.post("/admin/jobs/release", {
+        lease,
+        outcome: "retry",
       })
     ).status,
     200,
   );
+  const jobs = (await (await service.request("/admin/jobs")).json()) as {
+    jobs: { region: string; retries: number; notBefore: string }[];
+  };
+  const b = jobs.jobs.find((entry) => entry.region === "b");
+  assert(b);
+  assert.equal(b.retries, 4);
+  assert(Date.parse(b.notBefore) >= releasedAt + 480_000);
+  assert(Date.parse(b.notBefore) <= Date.now() + 480_000);
+});
+
+test("cancelling a batch fences its leases and lets a new batch start", async (context) => {
+  const service = await fixture(context);
+  const batchId = (await service.start(["a", "b"])).body.batchId;
+  const lease = (await service.claim([])).body.lease;
+  assert(lease);
+  assert.equal((await service.start(["a"])).body.error, "batch_active");
+  const cancelled = await service.post("/admin/jobs/cancel", { batchId });
+  assert.equal(cancelled.status, 200);
+  assert.deepEqual(cancelled.body, { batchId, cancelled: 2 });
+  assert.deepEqual(
+    (await service.post("/admin/jobs/cancel", { batchId })).body,
+    {
+      batchId,
+      cancelled: 0,
+    },
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/renew", { lease })).body.error,
+    "lease_lost",
+  );
+  assert.equal(
+    (await service.post("/admin/jobs/release", { lease, outcome: "retry" }))
+      .status,
+    200,
+  );
+  const jobs = (await (await service.request("/admin/jobs")).json()) as {
+    finishedAt: string | null;
+    cancelled: number;
+  };
+  assert.notEqual(jobs.finishedAt, null);
+  assert.equal(jobs.cancelled, 2);
+  assert.equal((await service.start(["a"])).status, 200);
+});
+
+test("retiring a region removes it from current unless the active batch still owns it", async (context) => {
+  const service = await publishedFixture(context);
+  assert.equal(
+    (await service.post("/admin/regions/retire", { regions: ["a"] })).body
+      .error,
+    "region_active",
+  );
+  const digest = await service.manifest("a", "2026-09-13T00:00:00Z");
+  assert.equal(
+    (
+      await service.post("/admin/publish", {
+        region: "a",
+        manifest: digest,
+        lease: service.lease,
+      })
+    ).status,
+    200,
+  );
+  const retired = await service.post("/admin/regions/retire", {
+    regions: ["a", "z"],
+  });
+  assert.equal(retired.status, 200);
+  assert.deepEqual(retired.body.removed, ["a"]);
+  const current = (await (
+    await service.request("/admin/state")
+  ).json()) as Current;
+  assert.deepEqual(current.regions, []);
+  assert.equal(current.revision, retired.body.revision);
+  const repeated = await service.post("/admin/regions/retire", {
+    regions: ["a"],
+  });
+  assert.deepEqual(repeated.body.removed, []);
+  assert.equal(repeated.body.revision, current.revision);
+  assert(await service.bucket.head(`manifests/${digest}.json`));
 });
 
 test("slot migration preserves running legacy leases and claim identities across deployment", async (context) => {

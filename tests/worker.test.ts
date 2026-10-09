@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type {
   Current,
@@ -18,7 +19,7 @@ import {
   queryBounds,
 } from "../worker/geo.ts";
 import worker, { Coordinator } from "../worker/index.ts";
-import type { PoiItem } from "../worker/poi.ts";
+import { matchPoi, type PoiItem } from "../worker/poi.ts";
 
 crypto.subtle.timingSafeEqual = (a, b) =>
   timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -816,6 +817,94 @@ test("spherical query bounds include cells across the dateline and preserve cano
   assert.equal(result.status, 200);
   assert.equal(result.body.count, 2);
   assert.equal(result.body.coverage, "partial");
+});
+
+test("POI acceptance and grid cells follow the contract shared with the builder", async () => {
+  const contract = JSON.parse(
+    await readFile(
+      new URL("./fixtures/poi-contract.json", import.meta.url),
+      "utf8",
+    ),
+  ) as {
+    pois: { tags: Record<string, string>; poi: boolean }[];
+    cells: { lat: number; lon: number; cell: string }[];
+  };
+
+  for (const { tags, poi: accepted } of contract.pois) {
+    const item = { id: "osm_node_1", lat: 0, lon: 0, tags };
+    assert.equal(
+      matchPoi(item, 0, 0, 10, "") !== null,
+      accepted,
+      JSON.stringify(tags),
+    );
+  }
+
+  for (const { lat, lon, cell } of contract.cells)
+    assert.equal(cellFor(lat, lon), cell, `${lat},${lon}`);
+});
+
+test("unnamed or unclassified POIs are skipped without failing the query", async () => {
+  const env = environment();
+  const item = addManifest(env, [
+    poi(1, 0, 0),
+    { id: "osm_node_2", lat: 0, lon: 0, tags: { amenity: "cafe" } },
+    {
+      id: "osm_node_3",
+      lat: 0,
+      lon: 0,
+      tags: { name: "Toilets", amenity: "toilets" },
+    },
+  ]);
+  await publish(env, item);
+  const result = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(result.status, 200);
+  assert.deepEqual(
+    result.body.results.map((entry) => entry.id),
+    ["osm_node_1"],
+  );
+});
+
+test("regions split at the antimeridian are read only for queries near their polygons", async () => {
+  const env = environment();
+  const coverage: Coverage = {
+    type: "MultiPolygon",
+    coordinates: [
+      polygon(-180, 50, -170, 60).coordinates,
+      polygon(170, 50, 180, 60).coordinates,
+    ],
+  };
+  const item = addManifest(env, [poi(1, 55, -175)], { coverage });
+  assert.equal((await publish(env, item)).status, 200);
+  const current = (await env.storage.get("current")) as Current;
+  assert.deepEqual(current.regions[0].bbox, [-180, 50, 180, 60]);
+  assert.deepEqual(current.regions[0].boxes, [
+    [-180, 50, -170, 60],
+    [170, 50, 180, 60],
+  ]);
+  env.cacheEntries.clear();
+  env.DATA.reads.length = 0;
+  const elsewhere = await call(env, "/api/osm/scan?lat=55&lng=0");
+  assert.equal(elsewhere.status, 200);
+  assert.equal(elsewhere.body.coverage, "uncovered");
+  assert.equal(env.DATA.reads.length, 0);
+  const near = await call(env, "/api/osm/scan?lat=55&lng=-175");
+  assert.equal(near.body.count, 1);
+  assert(env.DATA.reads.includes(`manifests/${item.digest}.json`));
+});
+
+test("retiring a region removes it from queries in the same isolate at once", async () => {
+  const env = environment();
+  const item = addManifest(env, [poi(1, 0, 0)]);
+  await publish(env, item);
+  assert.equal((await call(env, "/api/osm/scan?lat=0&lng=0")).body.count, 1);
+  const retired = await admin(env, "/admin/regions/retire", {
+    regions: ["test"],
+  });
+  assert.equal(retired.status, 200);
+  const result = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(result.body.coverage, "uncovered");
+  assert.equal(result.body.count, 0);
+  assert.equal(result.body.revision, retired.body.revision);
 });
 
 test("coverage handles holes, borders and disjoint bounding-box corners", async () => {

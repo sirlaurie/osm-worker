@@ -22,6 +22,9 @@ const RENEW_SECONDS = 60;
 const AFFINITY_SECONDS = 120;
 const CLAIM_IDEMPOTENCY_SECONDS = 24 * 60 * 60;
 const MAX_JOB_REQUEST = 256 * 1024;
+const RETRY_SECONDS = 60;
+const MAX_RETRY_SECONDS = 24 * 60 * 60;
+const MAX_ERROR_LENGTH = 1000;
 
 export interface Lease {
   batchId: string;
@@ -52,12 +55,21 @@ interface Batch {
 interface Job {
   region: string;
   extract: string;
-  status: "pending" | "running" | "completed" | "failed" | "skipped";
+  status:
+    | "pending"
+    | "running"
+    | "completed"
+    | "failed"
+    | "skipped"
+    | "cancelled";
   generation: number;
   lastOwner: string | null;
   lease: Lease | null;
   manifest: string | null;
   updatedAt: string;
+  retries?: number;
+  notBefore?: string | null;
+  lastError?: string | null;
 }
 
 interface Device {
@@ -157,6 +169,7 @@ function counts(jobs: Job[], now: number) {
     failed: 0,
     completed: 0,
     skipped: 0,
+    cancelled: 0,
   };
 
   for (const job of jobs) result[status(job, now)]++;
@@ -367,7 +380,9 @@ export class Coordinator {
           "/admin/jobs/claim",
           "/admin/jobs/renew",
           "/admin/jobs/release",
+          "/admin/jobs/cancel",
           "/admin/publish",
+          "/admin/regions/retire",
         ].includes(path)
       )
         throw new ServiceError(
@@ -392,7 +407,9 @@ export class Coordinator {
       const payload = parseJSON(
         await readBytes(
           request.body,
-          path === "/admin/jobs/start" || path === "/admin/jobs/claim"
+          path === "/admin/jobs/start" ||
+            path === "/admin/jobs/claim" ||
+            path === "/admin/regions/retire"
             ? MAX_JOB_REQUEST
             : 4096,
           413,
@@ -404,6 +421,12 @@ export class Coordinator {
 
       if (path === "/admin/jobs/claim") return json(await this.claim(payload));
 
+      if (path === "/admin/jobs/cancel")
+        return json(await this.cancel(payload));
+
+      if (path === "/admin/regions/retire")
+        return json(await this.retire(payload));
+
       if (path === "/admin/publish")
         return json(await this.publish(payload, new URL(request.url).origin));
 
@@ -413,10 +436,25 @@ export class Coordinator {
       if (path === "/admin/jobs/renew")
         return json(await this.renew(payload.lease));
 
-      if (payload.outcome !== "failed" && payload.outcome !== "retry")
+      if (
+        (payload.outcome !== "failed" && payload.outcome !== "retry") ||
+        (payload.error !== undefined && typeof payload.error !== "string") ||
+        (payload.retryAfterSeconds !== undefined &&
+          (typeof payload.retryAfterSeconds !== "number" ||
+            !Number.isSafeInteger(payload.retryAfterSeconds) ||
+            payload.retryAfterSeconds < 0 ||
+            payload.retryAfterSeconds > MAX_RETRY_SECONDS))
+      )
         throw new ServiceError(400, "invalid_release");
 
-      return json(await this.release(payload.lease, payload.outcome));
+      return json(
+        await this.release(
+          payload.lease,
+          payload.outcome,
+          payload.error?.slice(0, MAX_ERROR_LENGTH) ?? null,
+          payload.retryAfterSeconds ?? 0,
+        ),
+      );
     } catch (error) {
       if (error instanceof ServiceError)
         return json({ success: false, error: error.code }, error.status);
@@ -577,6 +615,8 @@ export class Coordinator {
         const candidates = jobs.filter((job) => {
           if (status(job, now) !== "pending") return false;
 
+          if (job.notBefore && Date.parse(job.notBefore) > now) return false;
+
           const pendingAt =
             job.status === "running" && job.lease
               ? Date.parse(job.lease.expiresAt)
@@ -670,7 +710,12 @@ export class Coordinator {
     });
   }
 
-  private async release(lease: Lease, outcome: "failed" | "retry") {
+  private async release(
+    lease: Lease,
+    outcome: "failed" | "retry",
+    error: string | null,
+    retryAfterSeconds: number,
+  ) {
     return this.state.storage.transaction(async (transaction) => {
       const now = Date.now();
       const job = await leaseJob(transaction, lease);
@@ -678,13 +723,25 @@ export class Coordinator {
       if (
         job.status === "pending" ||
         job.status === "failed" ||
-        job.status === "completed"
+        job.status === "completed" ||
+        job.status === "cancelled"
       )
         return { success: true };
 
       requireRunning(job, now);
       job.status = outcome === "retry" ? "pending" : "failed";
       job.updatedAt = new Date(now).toISOString();
+      job.lastError = error;
+
+      if (outcome === "retry") {
+        job.retries = (job.retries ?? 0) + 1;
+        const delay = Math.max(
+          retryAfterSeconds,
+          Math.min(MAX_RETRY_SECONDS, RETRY_SECONDS * 2 ** (job.retries - 1)),
+        );
+        job.notBefore = new Date(now + delay * 1000).toISOString();
+      }
+
       await transaction.put(`job:${lease.batchId}:${lease.region}`, job);
       const batch = await loadBatch(transaction, lease.batchId);
       await finishBatch(
@@ -695,6 +752,90 @@ export class Coordinator {
       );
 
       return { success: true };
+    });
+  }
+
+  private async cancel(payload: unknown) {
+    if (!record(payload) || !uuid(payload.batchId))
+      throw new ServiceError(400, "invalid_cancel");
+
+    const { batchId } = payload;
+
+    return this.state.storage.transaction(async (transaction) => {
+      const now = Date.now();
+      const batch = await transaction.get<Batch>(`batch:${batchId}`);
+
+      if (!batch) throw new ServiceError(404, "batch_not_found");
+
+      if (batch.finishedAt) return { batchId, cancelled: 0 };
+
+      const jobs = await loadJobs(transaction, batch);
+      let cancelled = 0;
+
+      for (const job of jobs) {
+        if (job.status !== "pending" && job.status !== "running") continue;
+
+        job.status = "cancelled";
+        job.updatedAt = new Date(now).toISOString();
+        await transaction.put(`job:${batchId}:${job.region}`, job);
+        cancelled++;
+      }
+
+      await finishBatch(transaction, batch, jobs, now);
+
+      return { batchId, cancelled };
+    });
+  }
+
+  private async retire(payload: unknown) {
+    if (
+      !record(payload) ||
+      !Array.isArray(payload.regions) ||
+      payload.regions.length < 1 ||
+      payload.regions.length > MAX_REGIONS ||
+      !payload.regions.every(
+        (region) => typeof region === "string" && REGION.test(region),
+      ) ||
+      new Set(payload.regions).size !== payload.regions.length
+    )
+      throw new ServiceError(400, "invalid_retire");
+
+    const regions = payload.regions as string[];
+
+    return this.state.storage.transaction(async (transaction) => {
+      const now = Date.now();
+      const active = await transaction.get<string>("active_batch");
+      const batch = active ? await loadBatch(transaction, active) : null;
+
+      if (
+        batch &&
+        !batch.finishedAt &&
+        (await loadJobs(transaction, batch)).some(
+          (job) =>
+            regions.includes(job.region) &&
+            (status(job, now) === "pending" || status(job, now) === "running"),
+        )
+      )
+        throw new ServiceError(409, "region_active");
+
+      const current = await loadCurrent(transaction);
+      const removed = (current?.regions ?? [])
+        .filter((entry) => regions.includes(entry.region))
+        .map((entry) => entry.region);
+
+      if (!current || removed.length === 0)
+        return { success: true, revision: current?.revision ?? null, removed };
+
+      const next: Current = {
+        schema: 1,
+        revision: crypto.randomUUID(),
+        regions: current.regions.filter(
+          (entry) => !regions.includes(entry.region),
+        ),
+      };
+      await transaction.put("current", next);
+
+      return { success: true, revision: next.revision, removed };
     });
   }
 
@@ -860,6 +1001,9 @@ export class Coordinator {
           slot: job.lease?.slot ?? null,
           expiresAt: job.lease?.expiresAt ?? null,
           manifest: job.manifest,
+          retries: job.retries ?? 0,
+          notBefore: job.notBefore ?? null,
+          lastError: job.lastError ?? null,
         })),
         devices: devices.map((device) => ({
           deviceId: device.deviceId,

@@ -119,6 +119,16 @@ export function coverageBounds(coverage: Coverage): Bounds {
   return result;
 }
 
+export function coverageBoxes(coverage: Coverage): Bounds[] | undefined {
+  const bounds = coverageBounds(coverage);
+
+  if (bounds[2] - bounds[0] <= 180) return undefined;
+
+  return polygons(coverage).map((polygon) =>
+    coverageBounds({ type: "Polygon", coordinates: polygon }),
+  );
+}
+
 function polygons(coverage: Coverage): Polygon[] {
   return coverage.type === "Polygon"
     ? [coverage.coordinates]

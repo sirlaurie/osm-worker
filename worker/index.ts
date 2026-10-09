@@ -322,7 +322,11 @@ async function loadCandidates(
   if (!cells) throw new ServiceError(422, "query_too_large");
 
   const releases = (current?.regions ?? [])
-    .filter((entry) => boxes.some((box) => intersects(box, entry.bbox)))
+    .filter((entry) =>
+      (entry.boxes ?? [entry.bbox]).some((bounds) =>
+        boxes.some((box) => intersects(box, bounds)),
+      ),
+    )
     .sort(
       (a, b) =>
         Date.parse(b.sourceTimestamp) - Date.parse(a.sourceTimestamp) ||
@@ -459,7 +463,11 @@ export default {
         await authorize(request, env);
         const response = await coordinator(env).fetch(request);
 
-        if (url.pathname === "/admin/publish" && response.ok)
+        if (
+          (url.pathname === "/admin/publish" ||
+            url.pathname === "/admin/regions/retire") &&
+          response.ok
+        )
           memo(env).published.delete("current");
 
         return response;
