@@ -50,6 +50,7 @@ interface Batch {
   regions: string[];
   createdAt: string;
   finishedAt: string | null;
+  failed?: number;
 }
 
 interface Job {
@@ -241,6 +242,7 @@ async function finishBatch(
     jobs.every((job) => job.status !== "pending" && job.status !== "running")
   ) {
     batch.finishedAt = new Date(now).toISOString();
+    batch.failed = jobs.filter((job) => job.status === "failed").length;
     await storage.put(`batch:${batch.batchId}`, batch);
   }
 }
@@ -576,26 +578,38 @@ export class Coordinator {
       const device: Device = { deviceId, localRegions, lastSeen: now };
       await transaction.put(`device:${deviceId}`, device);
       const claimKey = `claim:${deviceId}:${requestId}`;
-      const claims = await transaction.list<Claim>({
-        prefix: `claim:${deviceId}:`,
-      });
-
-      for (const [key, saved] of claims) {
-        if (saved.retainUntil <= now) await transaction.delete(key);
-      }
-
-      const saved = claims.get(claimKey);
+      const saved = await transaction.get<Claim>(claimKey);
       const prior = saved && saved.retainUntil > now ? saved : undefined;
+
+      if (prior && prior.lease.slot !== slot)
+        throw new ServiceError(400, "invalid_claim");
+
       const batchId = prior
         ? prior.batchId
         : ((await transaction.get<string>("active_batch")) ?? null);
       const batch = batchId ? await loadBatch(transaction, batchId) : null;
+
+      if (batch?.finishedAt) {
+        if (batch.failed === undefined) {
+          batch.failed = (await loadJobs(transaction, batch)).filter(
+            (job) => job.status === "failed",
+          ).length;
+          await transaction.put(`batch:${batch.batchId}`, batch);
+        }
+
+        return {
+          batchId: batch.batchId,
+          lease: null,
+          pending: 0,
+          running: 0,
+          failed: batch.failed,
+          retryAfterSeconds: RENEW_SECONDS,
+        };
+      }
+
       const jobs = batch ? await loadJobs(transaction, batch) : [];
 
       if (prior) {
-        if (prior.lease.slot !== slot)
-          throw new ServiceError(400, "invalid_claim");
-
         const job = jobs.find((entry) => sameLease(entry.lease, prior.lease));
         const lease = job && status(job, now) === "running" ? job.lease : null;
 
@@ -676,12 +690,19 @@ export class Coordinator {
         }
       }
 
-      if (lease)
+      if (lease) {
+        for (const [key, claim] of await transaction.list<Claim>({
+          prefix: `claim:${deviceId}:`,
+        })) {
+          if (claim.retainUntil <= now) await transaction.delete(key);
+        }
+
         await transaction.put(claimKey, {
           batchId,
           lease,
           retainUntil: now + CLAIM_IDEMPOTENCY_SECONDS * 1000,
         } satisfies Claim);
+      }
 
       return claimResult(batch, jobs, lease, now);
     });

@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import type {
-  Current,
-  LegacyManifest,
-  Manifest,
-  Poi,
-  RegionRelease,
+import {
+  type Current,
+  groupFor,
+  type IndexedManifest,
+  type LegacyManifest,
+  type Manifest,
+  type PackedPage,
+  type Poi,
+  type RegionRelease,
 } from "../worker/data.ts";
 import {
   type Coverage,
@@ -119,16 +122,26 @@ class Bucket {
     return entry;
   }
 
-  async get(key: string) {
+  async get(
+    key: string,
+    options?: { range?: { offset: number; length: number } },
+  ) {
     this.reads.push(key);
     const entry = this.entries.get(key);
 
     if (!entry) return null;
 
+    const range = options?.range;
+
     return {
       size: entry.bytes.length,
       etag: entry.etag,
-      body: new Response(entry.bytes).body,
+      range,
+      body: new Response(
+        range
+          ? entry.bytes.subarray(range.offset, range.offset + range.length)
+          : entry.bytes,
+      ).body,
     };
   }
 
@@ -166,9 +179,12 @@ class Bucket {
 
 class ObjectStorage {
   entries = new Map<string, unknown>();
+  usage = { rowsRead: 0 };
   private pending: Promise<unknown> = Promise.resolve();
 
   async get(key: string) {
+    this.usage.rowsRead++;
+
     return structuredClone(this.entries.get(key));
   }
 
@@ -186,17 +202,21 @@ class ObjectStorage {
   }
 
   async list(options: { prefix?: string } = {}) {
-    return new Map(
+    const rows = new Map(
       [...this.entries]
         .filter(([key]) => key.startsWith(options.prefix ?? ""))
         .map(([key, value]) => [key, structuredClone(value)]),
     );
+    this.usage.rowsRead += rows.size;
+
+    return rows;
   }
 
   async transaction<T>(callback: (storage: ObjectStorage) => Promise<T>) {
     const task = this.pending.then(async () => {
       const transaction = new ObjectStorage();
       transaction.entries = structuredClone(this.entries);
+      transaction.usage = this.usage;
       const result = await callback(transaction);
       this.entries = transaction.entries;
 
@@ -309,6 +329,46 @@ function addManifest(
   env.DATA.save(`manifests/${digest}.json`, bytes.toString());
 
   return { manifest, digest };
+}
+
+function addIndexed(env: ReturnType<typeof environment>, blocks: Poi[][]) {
+  const chunks = blocks.map((block) => Buffer.from(JSON.stringify(block)));
+  const pack = Buffer.concat(chunks);
+  const packHash = hash(pack);
+  env.DATA.entries.set(`packs/${packHash}.bin`, {
+    bytes: pack,
+    etag: crypto.randomUUID(),
+  });
+  const cells: Record<string, PackedPage[]> = {};
+  let offset = 0;
+
+  for (const [index, block] of blocks.entries()) {
+    const cell = cellFor(block[0].lat, block[0].lon);
+    cells[cell] = [
+      ...(cells[cell] ?? []),
+      [hash(chunks[index]), 0, offset, chunks[index].length],
+    ];
+    offset += chunks[index].length;
+  }
+
+  const group = groupFor(Object.keys(cells)[0]);
+  const index = JSON.stringify({ group, packs: [packHash], cells });
+  env.DATA.save(`indexes/${hash(index)}.json`, index);
+  const manifest: IndexedManifest = {
+    schema: 3,
+    region: "test",
+    sourceTimestamp: "2026-09-11T00:00:00Z",
+    sourceSequence: 1,
+    sourceSHA256: "a".repeat(64),
+    coverage: polygon(-1, -1, 1, 1),
+    packs: [packHash],
+    groups: { [group]: hash(index) },
+    count: blocks.flat().length,
+  };
+  const bytes = JSON.stringify(manifest);
+  env.DATA.save(`manifests/${hash(bytes)}.json`, bytes);
+
+  return { manifest, digest: hash(bytes) };
 }
 
 async function call(
@@ -892,6 +952,48 @@ test("regions split at the antimeridian are read only for queries near their pol
   assert(env.DATA.reads.includes(`manifests/${item.digest}.json`));
 });
 
+test("blocks that share a pack load with one R2 range read per query", async () => {
+  const env = environment();
+  const item = addIndexed(env, [
+    [poi(1, 0, 0.0099, "West cafe")],
+    [poi(2, 0, 0.0101, "East cafe")],
+  ]);
+  assert.equal((await publish(env, item)).status, 200);
+  env.cacheEntries.clear();
+  env.DATA.reads.length = 0;
+  const result = await call(env, "/api/osm/scan?lat=0&lng=0.01&radius=300");
+  assert.equal(result.status, 200);
+  assert.equal(result.body.count, 2);
+  assert.equal(
+    env.DATA.reads.filter((key) => key.startsWith("packs/")).length,
+    1,
+  );
+});
+
+test("claims after a finished batch read a fixed number of stored rows", async () => {
+  const env = environment();
+  const regions = Array.from({ length: 50 }, (_, index) => ({
+    id: `region-${index}`,
+    extract: `test/region-${index}`,
+  }));
+  const started = await admin(env, "/admin/jobs/start", {
+    requestId: crypto.randomUUID(),
+    mode: "update",
+    regions,
+  });
+  await admin(env, "/admin/jobs/cancel", { batchId: started.body.batchId });
+  env.storage.usage.rowsRead = 0;
+  const claimed = await admin(env, "/admin/jobs/claim", {
+    slot: 0,
+    deviceId: crypto.randomUUID(),
+    requestId: crypto.randomUUID(),
+    localRegions: [],
+  });
+  assert.equal(claimed.status, 200);
+  assert.equal(claimed.body.lease, null);
+  assert(env.storage.usage.rowsRead <= 4, `${env.storage.usage.rowsRead}`);
+});
+
 test("retiring a region removes it from queries in the same isolate at once", async () => {
   const env = environment();
   const item = addManifest(env, [poi(1, 0, 0)]);
@@ -1073,7 +1175,14 @@ test("published state is memoised per isolate, refreshed by newer pins, publishe
     addManifest(env, records, { region: "second" }),
   );
   context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  context.mock.timers.tick(10_001);
+  context.mock.timers.tick(59_000);
+  const requests = env.coordinatorRequests.length;
+  const cached = await call(env, "/api/osm/scan?lat=0&lng=0");
+  assert.equal(cached.body.revision, two.body.revision);
+  const health = await call(env, "/health");
+  assert.equal(health.body.revision, two.body.revision);
+  assert.equal(env.coordinatorRequests.length, requests);
+  context.mock.timers.tick(1_001);
   const expired = await call(env, "/api/osm/scan?lat=0&lng=0");
   assert.equal(expired.body.revision, three.body.revision);
   const own = await publish(

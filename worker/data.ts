@@ -551,6 +551,36 @@ export async function readCurrent(
   return { current, etag: object.etag };
 }
 
+export async function readRange(
+  bucket: R2Bucket,
+  packed: PackedBlock,
+): Promise<Uint8Array> {
+  const object = await bucket.get(`packs/${packed.pack}.bin`, {
+    range: { offset: packed.offset, length: packed.length },
+  });
+
+  if (!object) throw new ServiceError(503, "missing_object");
+
+  if (object.size > MAX_PACK) {
+    await object.body.cancel();
+    throw new ServiceError(503, "object_too_large");
+  }
+
+  if (
+    !object.range ||
+    !("offset" in object.range) ||
+    !("length" in object.range) ||
+    object.range.offset !== packed.offset ||
+    object.range.length !== packed.length ||
+    object.size < packed.offset + packed.length
+  ) {
+    await object.body.cancel();
+    throw new ServiceError(503, "invalid_range");
+  }
+
+  return readBytes(object.body, packed.length);
+}
+
 export async function readImmutable(
   bucket: R2Bucket,
   key: string,
@@ -559,6 +589,8 @@ export async function readImmutable(
   origin: string,
   ctx: Pick<ExecutionContext, "waitUntil">,
   packed?: PackedBlock,
+  range: (packed: PackedBlock) => Promise<Uint8Array> = (packed) =>
+    readRange(bucket, packed),
 ): Promise<{ value: unknown; size: number }> {
   const cacheKey = new Request(`${origin}/__objects/${key}`);
   const cached = await caches.default.match(cacheKey);
@@ -569,34 +601,19 @@ export async function readImmutable(
 
   if (cached) {
     bytes = await readBytes(cached.body, maximum);
+  } else if (packed) {
+    bytes = await range(packed);
   } else {
-    const object = packed
-      ? await bucket.get(`packs/${packed.pack}.bin`, {
-          range: { offset: packed.offset, length: packed.length },
-        })
-      : await bucket.get(key);
+    const object = await bucket.get(key);
 
     if (!object) throw new ServiceError(503, "missing_object");
 
-    if (object.size > (packed ? MAX_PACK : maximum)) {
+    if (object.size > maximum) {
       await object.body.cancel();
       throw new ServiceError(503, "object_too_large");
     }
 
-    if (
-      packed &&
-      (!object.range ||
-        !("offset" in object.range) ||
-        !("length" in object.range) ||
-        object.range.offset !== packed.offset ||
-        object.range.length !== packed.length ||
-        object.size < packed.offset + packed.length)
-    ) {
-      await object.body.cancel();
-      throw new ServiceError(503, "invalid_range");
-    }
-
-    bytes = await readBytes(object.body, packed?.length ?? maximum);
+    bytes = await readBytes(object.body, maximum);
   }
 
   if (packed && bytes.byteLength !== packed.length)

@@ -15,6 +15,7 @@ import {
   parseJSON,
   readBytes,
   readImmutable,
+  readRange,
   record,
   releaseFor,
   ServiceError,
@@ -38,7 +39,7 @@ import { formatPoi, type MatchedPoi, matchPoi } from "./poi.ts";
 
 export { Coordinator } from "./coordinator.ts";
 
-const PUBLISHED_TTL_MS = 10_000;
+const PUBLISHED_TTL_MS = 60_000;
 const MANIFEST_MEMO_BYTES = 16 * 1024 * 1024;
 const INDEX_MEMO_BYTES = 8 * 1024 * 1024;
 const BLOCK_MEMO_BYTES = 8 * 1024 * 1024;
@@ -471,6 +472,40 @@ async function loadCandidates(
   const seen = new Set<string>();
   let blockBytes = 0;
 
+  const spans = new Map<string, { offset: number; end: number }>();
+
+  for (const { packed } of blocks.values()) {
+    if (!packed) continue;
+
+    const span = spans.get(packed.pack);
+    spans.set(packed.pack, {
+      offset: Math.min(span?.offset ?? packed.offset, packed.offset),
+      end: Math.max(span?.end ?? 0, packed.offset + packed.length),
+    });
+  }
+
+  const reads = new Map<string, Promise<Uint8Array>>();
+  const range = async (packed: PackedBlock) => {
+    const span = spans.get(packed.pack) ?? {
+      offset: packed.offset,
+      end: packed.offset + packed.length,
+    };
+    let read = reads.get(packed.pack);
+
+    if (!read) {
+      read = readRange(env.DATA, {
+        pack: packed.pack,
+        offset: span.offset,
+        length: span.end - span.offset,
+      });
+      reads.set(packed.pack, read);
+    }
+
+    const start = packed.offset - span.offset;
+
+    return (await read).subarray(start, start + packed.length);
+  };
+
   for (const [hash, block] of blocks) {
     const loaded = await memo(env).blocks.load(hash, ctx, async () => {
       const read = await readImmutable(
@@ -481,6 +516,7 @@ async function loadCandidates(
         url.origin,
         ctx,
         block.packed,
+        range,
       );
       validateBlock(read.value);
 
@@ -534,7 +570,7 @@ export default {
         throw new ServiceError(405, "method_not_allowed");
 
       if (url.pathname === "/health") {
-        const current = await readPublished(env);
+        const current = await published(env, ctx);
 
         return json({
           success: true,
