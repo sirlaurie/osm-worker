@@ -23,6 +23,7 @@ const AFFINITY_SECONDS = 120;
 const CLAIM_IDEMPOTENCY_SECONDS = 24 * 60 * 60;
 const MAX_JOB_REQUEST = 256 * 1024;
 const RETRY_SECONDS = 60;
+const MAX_SOURCE_RETRIES = 3;
 const MAX_RETRY_SECONDS = 24 * 60 * 60;
 const MAX_ERROR_LENGTH = 1000;
 
@@ -69,8 +70,13 @@ interface Job {
   manifest: string | null;
   updatedAt: string;
   retries?: number;
+  sourceRetries?: number;
   notBefore?: string | null;
   lastError?: string | null;
+}
+
+function postponed(job: Job): boolean {
+  return (job.sourceRetries ?? 0) > MAX_SOURCE_RETRIES;
 }
 
 interface Device {
@@ -445,7 +451,8 @@ export class Coordinator {
           (typeof payload.retryAfterSeconds !== "number" ||
             !Number.isSafeInteger(payload.retryAfterSeconds) ||
             payload.retryAfterSeconds < 0 ||
-            payload.retryAfterSeconds > MAX_RETRY_SECONDS))
+            payload.retryAfterSeconds > MAX_RETRY_SECONDS)) ||
+        (payload.source !== undefined && typeof payload.source !== "boolean")
       )
         throw new ServiceError(400, "invalid_release");
 
@@ -455,6 +462,7 @@ export class Coordinator {
           payload.outcome,
           payload.error?.slice(0, MAX_ERROR_LENGTH) ?? null,
           payload.retryAfterSeconds ?? 0,
+          payload.source ?? false,
         ),
       );
     } catch (error) {
@@ -626,10 +634,17 @@ export class Coordinator {
 
       if (!lease && batch && !batch.finishedAt) {
         const devices = await transaction.list<Device>({ prefix: "device:" });
+        const regular = jobs.some(
+          (job) =>
+            !postponed(job) &&
+            (status(job, now) === "pending" || status(job, now) === "running"),
+        );
         const candidates = jobs.filter((job) => {
           if (status(job, now) !== "pending") return false;
 
           if (job.notBefore && Date.parse(job.notBefore) > now) return false;
+
+          if (postponed(job) && regular) return false;
 
           const pendingAt =
             job.status === "running" && job.lease
@@ -736,6 +751,7 @@ export class Coordinator {
     outcome: "failed" | "retry",
     error: string | null,
     retryAfterSeconds: number,
+    source: boolean,
   ) {
     return this.state.storage.transaction(async (transaction) => {
       const now = Date.now();
@@ -750,11 +766,19 @@ export class Coordinator {
         return { success: true };
 
       requireRunning(job, now);
-      job.status = outcome === "retry" ? "pending" : "failed";
       job.updatedAt = new Date(now).toISOString();
       job.lastError = error;
 
-      if (outcome === "retry") {
+      if (outcome === "retry" && source)
+        job.sourceRetries = (job.sourceRetries ?? 0) + 1;
+
+      job.status =
+        outcome === "failed" ||
+        (job.sourceRetries ?? 0) > MAX_SOURCE_RETRIES + 1
+          ? "failed"
+          : "pending";
+
+      if (job.status === "pending") {
         job.retries = (job.retries ?? 0) + 1;
         const delay = Math.max(
           retryAfterSeconds,
@@ -1023,6 +1047,7 @@ export class Coordinator {
           expiresAt: job.lease?.expiresAt ?? null,
           manifest: job.manifest,
           retries: job.retries ?? 0,
+          sourceRetries: job.sourceRetries ?? 0,
           notBefore: job.notBefore ?? null,
           lastError: job.lastError ?? null,
         })),

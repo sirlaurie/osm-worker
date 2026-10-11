@@ -823,6 +823,96 @@ test("retry release returns only its region to pending and fences the returned l
   );
 });
 
+async function postponedFixture(context: TestContext, regions: string[]) {
+  const batchId = randomUUID();
+  const now = Date.now();
+  const records: Record<string, unknown> = {
+    migration_complete: true,
+    lease_slots_migrated: true,
+    current: null,
+    active_batch: batchId,
+    [`batch:${batchId}`]: {
+      batchId,
+      requestId: randomUUID(),
+      mode: "update",
+      regions,
+      createdAt: new Date(now - 600_000).toISOString(),
+      finishedAt: null,
+    },
+  };
+
+  for (const region of regions) {
+    records[`job:${batchId}:${region}`] = {
+      region,
+      extract: `test/${region}`,
+      status: "pending",
+      generation: 1,
+      lastOwner: null,
+      lease: null,
+      manifest: null,
+      updatedAt: new Date(now - 600_000).toISOString(),
+      ...(region === "a"
+        ? {
+            retries: 4,
+            sourceRetries: 4,
+            notBefore: new Date(now - 1_000).toISOString(),
+          }
+        : {}),
+    };
+    records[`generation:${region}`] = 1;
+  }
+
+  return fixture(context, records);
+}
+
+test("a region with three failed source retries waits behind every other region", async (context) => {
+  const service = await postponedFixture(context, ["a", "b"]);
+  const deviceId = randomUUID();
+  const other = (await service.claim([], deviceId)).body.lease;
+  assert(other);
+  assert.equal(other.region, "b");
+  assert.equal(
+    (await service.claim([], deviceId, randomUUID(), 1)).body.lease,
+    null,
+  );
+  assert.equal(
+    (
+      await service.post("/admin/jobs/release", {
+        lease: other,
+        outcome: "failed",
+      })
+    ).status,
+    200,
+  );
+  const last = (await service.claim([], deviceId, randomUUID(), 1)).body.lease;
+  assert(last);
+  assert.equal(last.region, "a");
+});
+
+test("a postponed region that fails its source again is marked failed", async (context) => {
+  const service = await postponedFixture(context, ["a"]);
+  const lease = (await service.claim([])).body.lease;
+  assert(lease);
+  assert.equal(
+    (
+      await service.post("/admin/jobs/release", {
+        lease,
+        outcome: "retry",
+        error: "Source download failed: HTTP 404",
+        source: true,
+      })
+    ).status,
+    200,
+  );
+  const jobs = (await (await service.request("/admin/jobs")).json()) as {
+    finishedAt: string | null;
+    jobs: { status: string; sourceRetries: number }[];
+  };
+  assert.equal(jobs.jobs[0].status, "failed");
+  assert.equal(jobs.jobs[0].sourceRetries, 5);
+  assert.notEqual(jobs.finishedAt, null);
+});
+
 test("retry releases are claimable only after their deferral and grow per region", async (context) => {
   const batchId = randomUUID();
   const now = Date.now();
