@@ -4,6 +4,8 @@
   "main": "worker/index.ts",
   "compatibility_date": "2026-09-10",
   "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [{ "pattern": "path.osm.autheai.com", "custom_domain": true }],
   "secrets": { "required": ["PUBLISH_TOKEN"] },
   "r2_buckets": [{ "binding": "DATA", "bucket_name": "aura-osm-data" }],
   "durable_objects": {
