@@ -8,7 +8,7 @@ Cloudflare GitHub Builds 部署 OSM Worker。代码推送触发部署。配置�
 
 部署条件：
 
-- R2 存储桶：`aura-osm-data`。
+- R2 存储桶：`path-osm-data`。位置：WNAM（北美西部）。
 - Secret：`PUBLISH_TOKEN`。长度：32 个字符或以上。值：OSM Builder 的 `OSM_PUBLISH_TOKEN`。
 
 ## 查询接口

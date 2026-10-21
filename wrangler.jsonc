@@ -7,7 +7,7 @@
   "workers_dev": true,
   "routes": [{ "pattern": "path.osm.autheai.com", "custom_domain": true }],
   "secrets": { "required": ["PUBLISH_TOKEN"] },
-  "r2_buckets": [{ "binding": "DATA", "bucket_name": "aura-osm-data" }],
+  "r2_buckets": [{ "binding": "DATA", "bucket_name": "path-osm-data" }],
   "durable_objects": {
     "bindings": [{ "name": "COORDINATOR", "class_name": "Coordinator" }]
   },
